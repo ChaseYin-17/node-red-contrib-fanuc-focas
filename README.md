@@ -1,3 +1,6 @@
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/zhideloh)
+
+
 # node-red-contrib-fanuc-focas
 
 A Node-RED node for collecting telemetry from **FANUC CNC controllers** via the **FOCAS2 TCP protocol**.
