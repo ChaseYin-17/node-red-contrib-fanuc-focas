@@ -186,14 +186,28 @@ class Focas {
         });
     }
 
+    // async disconnect() {
+    //     if (!this.socket) return;
+    //     try {
+    //         await this._send(encap(FTYPE_CLS_REQU, Buffer.alloc(0)));
+    //         await this._recv();
+    //     } catch (_) {}
+    //     this.socket.destroy();
+    //     this.socket = null;
+    // }
+
     async disconnect() {
         if (!this.socket) return;
+        const sock = this.socket;
+        this.socket = null;       // ← clear ref first — prevents double-disconnect if new poll fires
         try {
-            await this._send(encap(FTYPE_CLS_REQU, Buffer.alloc(0)));
-            await this._recv();
+            sock.write(encap(FTYPE_CLS_REQU, Buffer.alloc(0)));
+            // ← NO await recv — controller's response stays unread in kernel buffer
         } catch (_) {}
-        this.socket.destroy();
-        this.socket = null;
+        sock.setTimeout(0);       // cancel any pending timeout
+        sock.setKeepAlive(false); // no keepalive probes on exit
+        sock.unref();             // don't block process exit
+        sock.destroy();           // close(fd) with unread data in buffer → Linux sends RST → no TIME_WAIT
     }
 
     // ── Request primitives ────────────────────────────────────────────────────
