@@ -4,6 +4,8 @@
  * Port of diohpix/pyfanuc with all known bug-fixes applied.
  *
  * Protocol constants match pyfanuc.py exactly.
+ * Wire behaviour is verified against the FANUC FOCAS2 SDK shipped in lib/FOCAS2 Library
+ * (see Document/SpecE/Misc/*.xml for per-function specs, ERRCODE.HTM for status codes).
  * All methods return Promises.
  */
 const net = require('net');
@@ -125,6 +127,22 @@ function parseParamBody(data, maxaxis, mode = 'param3') {
         r[varname] = values;
     }
     return r;
+}
+
+// ── FOCAS status codes ────────────────────────────────────────────────────────
+// FOCAS2 spec: lib/FOCAS2 Library/Document/SpecE/ERRCODE.HTM
+const FOCAS_ERRORS = {
+    '-17':'EW_PROTOCOL', '-16':'EW_SOCKET', '-15':'EW_NODLL', '-11':'EW_BUS',
+    '-10':'EW_SYSTEM2',   '-9':'EW_HSSB',    '-8':'EW_HANDLE', '-7':'EW_VERSION',
+     '-6':'EW_UNEXP',     '-5':'EW_SYSTEM',  '-4':'EW_PARITY', '-3':'EW_MMCSYS',
+     '-2':'EW_RESET',     '-1':'EW_BUSY',      '0':'EW_OK',      '1':'EW_FUNC',
+      '2':'EW_LENGTH',     '3':'EW_NUMBER',    '4':'EW_ATTRIB',  '5':'EW_DATA',
+      '6':'EW_NOOPT',      '7':'EW_PROT',      '8':'EW_OVRFLOW', '9':'EW_PARAM',
+     '10':'EW_BUFFER',    '11':'EW_PATH',     '12':'EW_MODE',   '13':'EW_REJECT',
+     '14':'EW_DTSRVR',    '15':'EW_ALARM',    '16':'EW_STOP',   '17':'EW_PASSWD',
+};
+function focasErrName(code) {
+    return FOCAS_ERRORS[String(code)] || 'EW_UNKNOWN';
 }
 
 // ── Main client class ─────────────────────────────────────────────────────────
@@ -337,10 +355,31 @@ class Focas {
         return (st.len === 8) ? decode8(st.data) : null;
     }
 
-    async readalarmcode(type, withtext = 1, maxmsgs = -1, textlength = 32) {
-        if (maxmsgs <= 0) maxmsgs = parseInt(this.sysinfo.axes) || 32;
+    /**
+     * cnc_rdalmmsg (0x23) — the alarm messages currently arising on the CNC.
+     *
+     * `type` is an alarm *category*, not a bitmask, and the enum is different on every
+     * CNC series (FOCAS2 spec: Document/SpecE/Misc/cnc_rdalmmsg.xml). -1 means "all type"
+     * on all series, which is what callers almost always want.
+     *
+     * The wire record is (16 + textlength) bytes — alm_no(i32) type(i32) axis(i32)
+     * msg_len(i32) text. The C ODBALMMSG struct is only 44 bytes because the three short
+     * attribute fields are widened to 4 bytes and `dummy` is dropped on the wire.
+     *
+     * Throws on a real FOCAS error (e.g. EW_ATTRIB for an out-of-range type) rather than
+     * returning [] — an empty array means "no alarms", nothing else.
+     */
+    async readalarmcode(type = -1, withtext = 1, maxmsgs = -1, textlength = 32) {
+        if (maxmsgs <= 0) maxmsgs = (this.sysinfo && this.sysinfo.maxaxis) || 32;
         const st = await this._reqSingle(1, 1, 0x23, type, maxmsgs, withtext, textlength);
-        if (st.len <= 0) return [];
+        if (st.len < 0)
+            throw new Error('cnc_rdalmmsg: malformed or empty response frame');
+        if (st.len === 0) {
+            // _reqSingle omits `error` entirely for a clean success carrying no data.
+            if (st.error !== undefined)
+                throw new Error(`cnc_rdalmmsg: CNC returned ${focasErrName(st.error)} (${st.error}) for type=${type}`);
+            return [];
+        }
         const stride = 4 * 4 + textlength;
         const ret = [];
         for (let pos = 0; pos + stride <= st.len; pos += stride) {
