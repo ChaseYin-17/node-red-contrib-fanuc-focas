@@ -13,6 +13,10 @@ const net = require('net');
 // ── Frame type constants ──────────────────────────────────────────────────────
 const FTYPE_OPN_REQU = 0x0101;
 const FTYPE_OPN_RESP = 0x0102;
+// Sent in place of the open response when the controller will not take the session —
+// observed when every slot is already in use. The payload is not documented in the
+// SDK, so the raw bytes are carried into the error instead of being interpreted.
+const FTYPE_OPN_REFUTED = 0x0103;
 const FTYPE_VAR_REQU = 0x2101;
 const FTYPE_VAR_RESP = 0x2102;
 const FTYPE_CLS_REQU = 0x0201;
@@ -165,6 +169,14 @@ function focasErrName(code) {
     return FOCAS_ERRORS[String(code)] || 'EW_UNKNOWN';
 }
 
+// The wire protocol gives no error text on a bad handshake, so the only way to tell
+// "the controller answered with something else" from "our stream is out of sync" is
+// to keep the first bytes of the offending reply in the message.
+function hexDump(buf, n = 16) {
+    const s = buf.slice(0, Math.min(buf.length, n)).toString('hex');
+    return s.length ? s.match(/../g).join(' ') : '(empty)';
+}
+
 // Turn a rejected `_reqSingle` result into the message it deserves. Both failure
 // shapes have to name the function and the CNC's reason: an EW_* status is a real
 // answer from the controller and must never be mistaken for "no data".
@@ -193,29 +205,76 @@ class Focas {
 
     _recv() {
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('FOCAS recv timeout')), this.timeout);
-            let buf = Buffer.alloc(0);
+            const socket  = this.socket;
+            let buf       = Buffer.alloc(0);
+            let settled   = false;
+            let timer     = null;
+
+            const cleanup = () => {
+                if (timer) clearTimeout(timer);
+                socket.removeListener('data',  onData);
+                socket.removeListener('error', onErr);
+                socket.removeListener('close', onClose);
+                socket.removeListener('end',   onEnd);
+            };
+            const fail = err => { if (settled) return; settled = true; cleanup(); reject(err); };
+            const done = raw => { if (settled) return; settled = true; cleanup(); resolve(raw); };
 
             const onData = chunk => {
                 buf = Buffer.concat([buf, chunk]);
                 if (buf.length < 10) return;
                 const expected = buf.readUInt16BE(8) + 10;
-                if (buf.length >= expected) {
-                    clearTimeout(timer);
-                    this.socket.removeListener('data', onData);
-                    this.socket.removeListener('error', onErr);
-                    resolve(buf.slice(0, expected));
-                }
+                if (buf.length >= expected) done(buf.slice(0, expected));
             };
-            const onErr = err => { clearTimeout(timer); reject(err); };
-            this.socket.on('data', onData);
-            this.socket.on('error', onErr);
+            const onErr   = err => fail(err);
+            // A controller that turns a session away commonly drops the connection
+            // rather than replying. Without these two that is a silent full-length hang
+            // reported as a generic timeout, which hides the real cause.
+            const onClose = () => fail(new Error('FOCAS connection closed by controller'));
+            const onEnd   = () => fail(new Error('FOCAS connection ended by controller'));
+
+            timer = setTimeout(() => {
+                fail(new Error('FOCAS recv timeout'));
+                // A partial frame may already have been consumed, so the stream is
+                // desynchronised and this socket cannot be reused. Destroying it here
+                // also stops a timed-out poll from holding a session on the controller.
+                this.destroy();
+            }, this.timeout);
+
+            socket.on('data',  onData);
+            socket.on('error', onErr);
+            socket.on('close', onClose);
+            socket.on('end',   onEnd);
         });
     }
 
     // ── Connect / disconnect ──────────────────────────────────────────────────
+    // Drop the socket without the CLS handshake. Safe to call repeatedly and on a
+    // socket that is already dead.
+    destroy() {
+        const sock = this.socket;
+        this.socket = null;
+        if (!sock) return;
+        sock.setTimeout(0);
+        sock.unref();
+        sock.destroy();
+    }
+
     connect() {
         return new Promise((resolve, reject) => {
+            let settled = false;
+            // Every failure path has to tear the socket down. A socket left ESTABLISHED
+            // after a refused handshake still occupies one of the controller's session
+            // slots, and those do not come back until this process releases it — which,
+            // with a poll opening a fresh session each time, means the next polls fail
+            // too for a reason that has nothing to do with them.
+            const done = err => {
+                if (settled) return;
+                settled = true;
+                if (err) { this.destroy(); reject(err); }
+                else     { resolve(); }
+            };
+
             this.socket = new net.Socket();
             this.socket.setTimeout(this.timeout);
             this.socket.connect(this.port, this.ip, async () => {
@@ -223,13 +282,32 @@ class Focas {
                     await this._send(encap(FTYPE_OPN_REQU, FRAME_DST));
                     const raw = await this._recv();
                     const res = decap(raw);
-                    if (res.ftype !== FTYPE_OPN_RESP) return reject(new Error('Open handshake failed'));
+                    if (res.ftype === FTYPE_OPN_REFUTED) {
+                        return done(new Error(
+                            'Open refused by controller — every FOCAS session is in use' +
+                            ` (ftype 0x0103, bytes=${raw.length}, head=${hexDump(raw)})`
+                        ));
+                    }
+                    if (res.ftype !== FTYPE_OPN_RESP) {
+                        const got = res.ftype === undefined
+                            ? 'no valid frame'
+                            : `0x${res.ftype.toString(16).padStart(4, '0')}`;
+                        return done(new Error(
+                            `Open handshake failed — expected ftype 0x0102, got ${got}` +
+                            ` (bytes=${raw.length}, head=${hexDump(raw)})`
+                        ));
+                    }
                     await this._getsysinfo();
-                    resolve();
-                } catch (e) { reject(e); }
+                    done();
+                } catch (e) { done(e); }
             });
-            this.socket.on('error', reject);
-            this.socket.on('timeout', () => reject(new Error('Connection timeout')));
+            // Kept attached after a successful connect on purpose: an 'error' with no
+            // listener is an uncaught exception, and this is a no-op once settled.
+            this.socket.on('error', done);
+            this.socket.on('timeout', () => {
+                if (settled) return;      // set up already — _recv owns the timeout now
+                done(new Error('Connection timeout'));
+            });
         });
     }
 
