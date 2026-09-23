@@ -32,10 +32,49 @@ const ALM_STATES = {
     4:'PS WARNING', 5:'FSSB WARNING', 6:'INSULATE WARNING',
     7:'ENCODER WARNING', 8:'PMC ALARM',
 };
-const ALARM_TYPES = {
-    0:'BG', 1:'TH', 2:'RS', 4:'SV', 8:'SW',
-    16:'IO', 32:'PS', 64:'OT', 128:'OH',
+// cnc_rdalmmsg alarm categories. `type` is an index into a per-series enum, NOT the
+// bitmask used by cnc_alarm — the same index means different things on different series.
+// FOCAS2 spec: lib/FOCAS2 Library/Document/SpecE/Misc/cnc_rdalmmsg.xml
+const ALM_TYPES_15I = {
+    0:'Background P/S (BG)', 1:'Foreground P/S (PS)', 2:'Overheat alarm (OH)',
+    3:'Sub-CPU error (SB)', 4:'Syncronized error (SN)', 5:'Parameter switch on (SW)',
+    6:'Overtravel,External data (OT)', 7:'PMC error (PC)', 8:'External alarm message (1) (EX)',
+    10:'Serious P/S (SR)', 12:'Servo alarm (SV)', 13:'I/O error (IO)',
+    14:'Power off parameter set (PW)', 15:'System alarm (SY)', 16:'External alarm message (2) (EX)',
+    17:'External alarm message (3) (EX)', 18:'External alarm message (4) (EX)',
+    19:'Macro alarm (MC)', 20:'Spindle alarm (SP)',
 };
+const ALM_TYPES_16I = {
+    0:'P/S100', 1:'P/S000', 2:'P/S101', 3:'P/S alarm except above', 4:'Overtravel alarm',
+    5:'Overheat alarm', 6:'Servo alarm', 7:'System alarm', 8:'APC alarm', 9:'Spindle alarm',
+    10:'P/S alarm(No.5000,..), Punchpress alarm', 11:'Laser alarm', 13:'Rigid tap alarm',
+    15:'External alarm message',
+};
+const ALM_TYPES_30I = {
+    0:'Parameter switch on (SW)', 1:'Power off parameter set (PW)', 2:'I/O error (IO)',
+    3:'Foreground P/S (PS)', 4:'Overtravel,External data (OT)', 5:'Overheat alarm (OH)',
+    6:'Servo alarm (SV)', 7:'Data I/O error (SR)', 8:'Macro alarm (MC)', 9:'Spindle alarm (SP)',
+    10:'Other alarm (DS)', 11:'Alarm concerning Malfunction prevent functions (IE)',
+    12:'Background P/S (BG)', 13:'Syncronized error (SN)', 14:'(reserved)',
+    15:'External alarm message (EX)', 19:'PMC error (PC)',
+};
+const ALM_TYPE_ALL = -1;   // -1 = all type, valid on every series
+
+// Pick the enum / text width that applies to this controller.
+// NOTE: cnc_type ' 0' covers the whole 0i family and cannot distinguish 0i-A/B/C
+// (16i enum) from 0i-D/F (30i enum). 0i-D/F is by far the more common today, so it is
+// the default; the raw numeric code is reported alongside the label so a wrong guess is
+// never silent.
+function almSeriesGroup(focas, cncSeries) {
+    const t = String((focas.sysinfo && focas.sysinfo.cnctype) || '').trim();
+    if (cncSeries === '15' || t === '15')            return '15i';
+    if (['30', '31', '32', '35'].includes(t))        return '30i';
+    if (['16', '18', '21', 'PD', 'PH'].includes(t))  return '16i';   // incl. Power Mate i-D/H
+    if (t === 'PM' || t === '0')                     return '30i';   // PMi-A / Series 0i
+    return cncSeries === '15' ? '15i' : '16i';
+}
+const ALM_TYPES_BY_GROUP = { '15i': ALM_TYPES_15I, '16i': ALM_TYPES_16I, '30i': ALM_TYPES_30I };
+const ALARM_MAX_MSGS = 10;   // messages read per poll
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function readParamVal(paramMap, key) {
@@ -126,13 +165,29 @@ async function fnPartCount(focas) {
     };
 }
 
-async function fnAlarmMessages(focas) {
-    const alarms = await focas.readalarmcode(1, 1, 10, 32);
+async function fnAlarmMessages(focas, cncSeries) {
+    const group = almSeriesGroup(focas, cncSeries);
+    const types = ALM_TYPES_BY_GROUP[group];
+    // cnc_rdalmmsg caps a message at 32 chars; the 30i family (incl. 0i-D/F, PMi-A) can
+    // go further and the spec recommends cnc_rdalmmsg2 there.
+    const textlength = group === '30i' ? 64 : 32;
+
+    let alarms;
+    try {
+        alarms = await focas.readalarmcode(ALM_TYPE_ALL, 1, ALARM_MAX_MSGS, textlength);
+    } catch (e) {
+        // Only retry when the CNC itself rejected the request — never after a transport fault.
+        if (textlength === 32 || !/^cnc_rdalmmsg: CNC returned/.test(e.message)) throw e;
+        // Firmware that rejects the extended width still answers the documented 32.
+        alarms = await focas.readalarmcode(ALM_TYPE_ALL, 1, ALARM_MAX_MSGS, 32);
+    }
+
     return (alarms || []).map(a => ({
-        type: a.alarmtype in ALARM_TYPES ? ALARM_TYPES[a.alarmtype] : String(a.alarmtype),
-        code: a.alarmcode,
-        axis: a.axis,
-        text: a.text,
+        type:      a.alarmtype in types ? types[a.alarmtype] : String(a.alarmtype),
+        type_code: a.alarmtype,
+        code:      a.alarmcode,
+        axis:      a.axis,
+        text:      a.text,
     }));
 }
 
@@ -183,17 +238,25 @@ async function fnMacro(focas, macroNums) {
 }
 
 // ── All-in-one (legacy behaviour) ────────────────────────────────────────────
-async function fnAll(focas, runModes) {
-    const [status, sysinfo, timers, program, parts, alarms] = [
-        await fnStatusInfo(focas, runModes),
-        await fnSystemInfo(focas),
-        await fnTimers(focas),
-        await fnProgramNumber(focas),
-        await fnPartCount(focas),
-        await fnAlarmMessages(focas),
-    ];
-    const feed    = await focas.readactfeed();
-    const spindle = await focas.readactspindlespeed();
+async function fnAll(focas, runModes, cncSeries) {
+    // Each field is read independently: one failing function degrades that field to null
+    // instead of blanking the whole snapshot. The reason lands in `errors`, keyed by the
+    // payload field it belongs to, so a null is never mistaken for "read cleanly, empty".
+    const errors = {};
+    const read = async (key, fn) => {
+        try { return await fn(); }
+        catch (e) { errors[key] = e.message || String(e); return null; }
+    };
+
+    const status  = await read('machine_state',      () => fnStatusInfo(focas, runModes));
+    const sysinfo = await read('controller',         () => fnSystemInfo(focas));
+    const timers  = await read('timers',             () => fnTimers(focas));
+    const program = await read('active_program',     () => fnProgramNumber(focas));
+    const parts   = await read('part_count',         () => fnPartCount(focas));
+    const alarms  = await read('active_alarms',      () => fnAlarmMessages(focas, cncSeries));
+    const feed    = await read('actual_feedrate_mm_min', () => focas.readactfeed());
+    const spindle = await read('actual_spindle_rpm',     () => focas.readactspindlespeed());
+
     return {
         controller:       sysinfo,
         machine_state:    status,
@@ -202,6 +265,7 @@ async function fnAll(focas, runModes) {
         part_count:       parts,
         feedrate_spindle: { actual_feedrate_mm_min: feed, actual_spindle_rpm: spindle },
         active_alarms:    alarms,
+        errors,
     };
 }
 
@@ -219,14 +283,19 @@ async function collect(ip, port, cnc_series, fn, subtype, params) {
             case 'timers':         result = await fnTimers(focas);                 break;
             case 'program_number': result = await fnProgramNumber(focas);          break;
             case 'part_count':     result = await fnPartCount(focas);              break;
-            case 'alarm_messages': result = await fnAlarmMessages(focas);          break;
+            case 'alarm_messages': result = await fnAlarmMessages(focas, cnc_series); break;
             case 'axes_data':      result = await fnAxesData(focas, subtype);      break;
             case 'parameters':     result = await fnParameters(focas, params);     break;
             case 'macro':          result = await fnMacro(focas, params);          break;
             case 'all':
-            default:               result = await fnAll(focas, runModes);          break;
+            default:               result = await fnAll(focas, runModes, cnc_series); break;
         }
-        result = { ...result, timestamp: new Date().toISOString() };
+        // Object-spreading a list-shaped result would turn it into {"0":..,"1":..},
+        // so alarm_messages keeps its array and gets the timestamp as a property.
+        const timestamp = new Date().toISOString();
+        result = Array.isArray(result)
+            ? Object.assign(result, { timestamp })
+            : { ...result, timestamp };
     } finally {
         await focas.disconnect();
     }

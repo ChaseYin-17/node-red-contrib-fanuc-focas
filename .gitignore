@@ -1,0 +1,6 @@
+# FANUC FOCAS2 SDK — proprietary, must not be redistributed.
+# Keep it local only: the node speaks the FOCAS2 wire protocol over TCP and never links it.
+# Referenced by focas.js/README as documentation for the wire format.
+lib/
+
+node_modules/

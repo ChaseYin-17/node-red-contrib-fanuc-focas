@@ -67,7 +67,7 @@ npm install node-red-contrib-fanuc-focas
 
 | Function | Description | `msg.payload` fields |
 |----------|-------------|----------------------|
-| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `active_alarms` |
+| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `active_alarms`, `errors` |
 | **Status Info** | Machine run state | `mode`, `run_state`, `motion`, `mstb`, `emergency`, `alarm`, `edit` |
 | **System Info** | Controller identity | `cnc_type`, `mt_type`, `series`, `version`, `axes` |
 | **Timers** | Accumulated time counters | `power_on_time`, `auto_operation_time`, `cutting_time`, `cycle_time` |
@@ -75,7 +75,7 @@ npm install node-red-contrib-fanuc-focas
 | **Parameters** | Raw CNC parameters | `{ [param_number]: value, … }` |
 | **Program Number** | Active program | `running_program`, `main_program`, `running_comment`, `main_comment` |
 | **Part Count** | Parts produced | `required_parts`, `lifetime_total` |
-| **Alarm Messages** | Active alarms | Array of `{ type, code, axis, text }` |
+| **Alarm Messages** | Active alarms | Array of `{ type, type_code, code, axis, text }` |
 | **Macro** | Custom macro variables | `{ [macro_number]: value, … }` |
 
 ### Axes Data sub-types
@@ -101,6 +101,64 @@ Each timer returns both a machine-readable value and a formatted string:
   "formatted": "14h 53m 14.237s"
 }
 ```
+
+### Alarm messages
+
+Active alarms are read with `cnc_rdalmmsg` using alarm category `-1` (*all type*), so every
+category is collected in one request. Each entry carries both the decoded label and the raw
+numeric category:
+
+```json
+[
+  {
+    "type": "Parameter switch on (SW)",
+    "type_code": 0,
+    "code": 100,
+    "axis": 0,
+    "text": "PARAMETER ENABLE SWITCH ON"
+  }
+]
+```
+
+> **Alarm `type` is not universal.** The numeric category is an index into a per-series enum —
+> the same number means different things on Series 15i, 16i/18i/21i/0i-A/B/C and
+> 30i/31i/32i/0i-D/F/PMi-A. The node picks the right table from the controller's reported
+> CNC type. `type_code` is always the raw value, so a label can be re-derived if the
+> controller is not recognised.
+>
+> Message text is limited to 32 characters by `cnc_rdalmmsg`; the 30i family is read with a
+> 64-character field, falling back to 32 if the firmware rejects it.
+
+When **Function** is `Alarm Messages` the payload is an **array**, with the poll timestamp
+attached as a property (not visible when the array is JSON-serialised). Other functions return
+an object containing `timestamp`.
+
+### Partial failures — All Data
+
+`All Data` reads every field independently, so one failing function degrades **only that field**
+instead of blanking the whole snapshot:
+
+```json
+{
+  "machine_state": { "mode": "MEMory", "run_state": "****", "alarm": "ALARM", "...": "..." },
+  "active_alarms": null,
+  "errors": {
+    "active_alarms": "cnc_rdalmmsg: CNC returned EW_NOOPT (6) for type=-1"
+  },
+  "timestamp": "2026-05-28T07:35:23.213Z"
+}
+```
+
+The rules:
+
+- A field that could not be read is **`null`**, and the reason appears in `errors` under the
+  same key (the field name, or `actual_feedrate_mm_min` / `actual_spindle_rpm` for the two
+  feedrate-spindle values).
+- `errors` is `{}` when every field read cleanly.
+- `active_alarms` is **`null` when the alarm read failed** and **`[]` when the controller
+  answered but has no active alarms** — the two are deliberately distinguishable.
+- Only the other **Functions** (single-value polls) raise. If you want a failure to be visible
+  as a node error rather than a degraded payload, poll `Alarm Messages` on its own.
 
 ---
 
@@ -145,6 +203,24 @@ Each timer returns both a machine-readable value and a formatted string:
     "actual_spindle_rpm": 101
   },
   "active_alarms": [],
+  "errors": {},
+  "timestamp": "2026-05-28T07:35:23.213Z"
+}
+```
+
+With an alarm present, `active_alarms` fills in:
+
+```json
+  "active_alarms": [
+    {
+      "type": "Parameter switch on (SW)",
+      "type_code": 0,
+      "code": 100,
+      "axis": 0,
+      "text": "PARAMETER ENABLE SWITCH ON"
+    }
+  ],
+  "errors": {},
   "timestamp": "2026-05-28T07:35:23.213Z"
 }
 ```
@@ -204,6 +280,8 @@ No additional npm dependencies — uses only Node.js built-ins (`net`, `Buffer`)
 - **FOCAS is strictly sequential.** Each request must complete before the next is sent on the same TCP connection. This node correctly awaits each response before proceeding.
 - **Connection per poll.** A new TCP connection is opened and cleanly closed for each poll cycle, matching the FOCAS session model.
 - The FOCAS wire protocol is reverse-engineered from [`diohpix/pyfanuc`](https://github.com/diohpix/pyfanuc) with several bug fixes applied (valtype-2 unpack, readparam3 fallback guard, statinfo cnctype matching).
+- Wire behaviour is cross-checked against the FANUC FOCAS2 SDK (`lib/FOCAS2 Library/`) — per-function specs in `Document/SpecE/Misc/`, status codes in `Document/SpecE/ERRCODE.HTM`.
+- FOCAS errors are surfaced, not swallowed: a request that the CNC rejects raises (e.g. `cnc_rdalmmsg: CNC returned EW_ATTRIB (4)`). An empty array from `readalarmcode()` therefore means *no alarms*, nothing else.
 
 ---
 
