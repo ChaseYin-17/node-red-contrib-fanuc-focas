@@ -130,5 +130,48 @@ function poll(msg) {
         Focas.prototype.readalarmcode = realAlarm;
     }
 
+    h('CASE 6 — the controller\'s cnc_type must pick the alarm enum, not cnc_series');
+    // cnc_series is whatever the flow was configured with; a flow copied from another
+    // machine carries that machine's series. Letting it win relabels every alarm while
+    // type_code stays put, so the mistake is invisible. Stub cnc_type and check which
+    // table the label comes from — the Series selector only offers 15 and 16.
+    const realSysinfo = Focas.prototype._getsysinfo;
+    const withCnctype = (t) => {
+        Focas.prototype._getsysinfo = async function () {
+            this.sysinfo = { addinfo: 0, maxaxis: 32, cnctype: t,
+                             mttype: ' M', series: 'G11Z', version: '13.0', axes: '03' };
+        };
+    };
+    const labels = async (cnctype, cncSeries) => {
+        withCnctype(cnctype);
+        configNode.cnc_series = cncSeries;
+        const p = (await poll({ function: 'alarm_messages' })).payload;
+        return Array.isArray(p) ? p.map(a => a.type) : [];
+    };
+    const type0 = (l) => l && l.length ? l[0] : null;
+    try {
+        const i31on16 = type0(await labels('31', '16'));
+        const i31on15 = type0(await labels('31', '15'));
+        console.log(`  cnc_type=31, cnc_series=16 → ${JSON.stringify(i31on16)}`);
+        console.log(`  cnc_type=31, cnc_series=15 → ${JSON.stringify(i31on15)}`);
+        if (!i31on16) console.log('  ⚠ no alarms on the controller — cannot tell the tables apart');
+        else if (i31on16 === i31on15) console.log('  ✔ a copied cnc_series no longer relabels the alarm');
+        else console.log('  ✗ cnc_series still overrides the controller\'s cnc_type');
+
+        const i15 = type0(await labels('15', '16'));
+        console.log(`  cnc_type=15, cnc_series=16 → ${JSON.stringify(i15)}`);
+        console.log(i31on16 && i15 !== i31on16
+            ? '  ✔ cnc_type does drive the table (15i enum differs from 30i)'
+            : '  ✗ cnc_type appears to be ignored');
+
+        const fallback = type0(await labels('zz', '15'));
+        console.log(`  cnc_type=zz (unusable), cnc_series=15 → ${JSON.stringify(fallback)}`);
+        console.log(i15 && fallback === i15
+            ? '  ✔ falls back to the configured series when cnc_type says nothing usable'
+            : '  ✗ fallback path broken');
+    } finally {
+        Focas.prototype._getsysinfo = realSysinfo;
+    }
+
     h('DONE');
 })().catch(e => { console.error('\nFATAL:', e && e.stack ? e.stack : e); process.exit(1); });

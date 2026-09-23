@@ -61,16 +61,23 @@ const ALM_TYPES_30I = {
 const ALM_TYPE_ALL = -1;   // -1 = all type, valid on every series
 
 // Pick the enum / text width that applies to this controller.
-// NOTE: cnc_type ' 0' covers the whole 0i family and cannot distinguish 0i-A/B/C
-// (16i enum) from 0i-D/F (30i enum). 0i-D/F is by far the more common today, so it is
-// the default; the raw numeric code is reported alongside the label so a wrong guess is
-// never silent.
+//
+// The controller's own CNC type decides. cnc_series is only what the flow was configured
+// with, and a flow copied from another machine carries that machine's series — letting it
+// win relabels every alarm while leaving type_code untouched, so a wrong table is silent.
+// It is consulted only when cnc_type says nothing usable.
+//
+// NOTE: cnc_type ' 0' covers the whole 0i family and cannot distinguish 0i-A/B/C (16i enum)
+// from 0i-D/F (30i enum), and the Series selector cannot express that either. 0i-D/F is by
+// far the more common today, so it is the default; the raw numeric code is reported
+// alongside the label so a wrong guess is never silent.
 function almSeriesGroup(focas, cncSeries) {
     const t = String((focas.sysinfo && focas.sysinfo.cnctype) || '').trim();
-    if (cncSeries === '15' || t === '15')            return '15i';
     if (['30', '31', '32', '35'].includes(t))        return '30i';
     if (['16', '18', '21', 'PD', 'PH'].includes(t))  return '16i';   // incl. Power Mate i-D/H
+    if (t === '15')                                  return '15i';
     if (t === 'PM' || t === '0')                     return '30i';   // PMi-A / Series 0i
+    // cnc_type unusable — older firmware or an unexpected value: fall back to the config.
     return cncSeries === '15' ? '15i' : '16i';
 }
 const ALM_TYPES_BY_GROUP = { '15i': ALM_TYPES_15I, '16i': ALM_TYPES_16I, '30i': ALM_TYPES_30I };
