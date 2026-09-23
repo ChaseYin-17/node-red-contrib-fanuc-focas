@@ -199,10 +199,23 @@ async function fnAxesData(focas, axisType) {
             return { actual_feedrate_mm_min: await focas.readactfeed() };
         case 'spindle_speed':
             return { actual_spindle_rpm: await focas.readactspindlespeed() };
-        case 'spindle_load':
-            return { spindle_load_percent: await focas.readspindleload() };
-        case 'servo_load':
-            return { servo_load_percent: await focas.readservoload() };
+        case 'spindle_load': {
+            // One value per spindle; the scalar is the first spindle so existing
+            // flows keep working, the array carries the rest.
+            const loads = await focas.readspmeter();
+            return {
+                spindle_load_percent:  loads.length ? loads[0] : null,
+                spindle_load_percents: loads,
+                spindle_load_names:    await focas.readspindlenames(loads.length),
+            };
+        }
+        case 'servo_load': {
+            const loads = await focas.readsvmeter();
+            return {
+                servo_load_percent: loads,
+                servo_load_axes:    await focas.readaxisnames(loads.length),
+            };
+        }
         case 'abs_pos':
             return { absolute_position: await focas.readaxes(1) };
         case 'rel_pos':

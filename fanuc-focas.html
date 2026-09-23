@@ -195,7 +195,10 @@
         <dt>Status Info</dt><dd>mode, run_state, motion, alarm, emergency, edit</dd>
         <dt>System Info</dt><dd>cnc_type, mt_type, series, version, axes</dd>
         <dt>Timers</dt><dd>power_on, auto_operation, cutting, cycle — with total_seconds and formatted</dd>
-        <dt>Axes Data</dt><dd>Position, servo/spindle load, feedrate — select sub-type</dd>
+        <dt>Axes Data</dt><dd>Position, servo/spindle load, feedrate — select sub-type.
+            Servo load returns one value per axis (<code>servo_load_percent</code>, array) alongside
+            <code>servo_load_axes</code>; spindle load returns <code>spindle_load_percent</code> (first
+            spindle) with <code>spindle_load_percents</code> and <code>spindle_load_names</code>.</dd>
         <dt>Parameters</dt><dd>Raw parameter values by number</dd>
         <dt>Program Number</dt><dd>Running and main program numbers with comments</dd>
         <dt>Part Count</dt><dd>Required and lifetime total parts</dd>
