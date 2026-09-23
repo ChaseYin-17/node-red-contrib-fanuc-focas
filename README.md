@@ -330,6 +330,7 @@ No additional npm dependencies — uses only Node.js built-ins (`net`, `Buffer`)
 - The load-meter function codes and their record layout were read off the official library's own traffic: the 64-bit SDK is driven over a local TCP proxy and the frames the vendor DLL puts on the wire are decoded (`tools/probe-funcsupport.js` prints the whole opcode support map for a controller). Guessing an opcode is what made the load meters silently report `null` — see `tools/verify-node-load.js`.
 - Opcodes are **per-series**, not universal: `cnc_diagnoss` (0x30) answers `EW_FUNC` on a controller that does not implement it, and `cnc_rdparam3` uses a different code on 16i than on 30i/0i-D. Where a function is optional, the node reports the `EW_*` status instead of degrading to `null`.
 - FOCAS errors are surfaced, not swallowed: a request that the CNC rejects raises (e.g. `cnc_rdalmmsg: CNC returned EW_ATTRIB (4)`). An empty array from `readalarmcode()` therefore means *no alarms*, nothing else.
+- Measured limits of the controllers this has been run against, and the changes deliberately put off for now, are kept in [`docs/notes.md`](docs/notes.md).
 
 ---
 
