@@ -22,6 +22,29 @@ const FRAMEHEAD = Buffer.from([0xa0, 0xa0, 0xa0, 0xa0]);
 const FRAME_DST = Buffer.from([0x00, 0x02]);
 const ALLAXIS   = -1;
 
+// ── Load-meter function codes ─────────────────────────────────────────────────
+// Taken from the official FOCAS2 library's own traffic (captured with a TCP proxy:
+// see tools/probe-diag.js for the raw opcode space). These are NOT diagnostics —
+// cnc_diagnoss (0x30) is a different, separately-licensed function that answers
+// EW_FUNC on controllers which do not implement it.
+const FN_SVMETER = 0x56;   // cnc_rdsvmeter — servo load meter
+const FN_SPMETER = 0x40;   // cnc_rdspmeter — spindle load meter / motor speed
+const FN_AXISNUM = 0xa4;   // axis or spindle count, selected by `type`
+const FN_SVNAME  = 0x89;   // cnc_rdaxisname  — servo axis names
+const FN_SPNAME  = 0x8a;   // cnc_rdspdlname  — spindle names
+
+const AXNUM_SPINDLE  = 1;  // FN_AXISNUM type: spindle count
+const AXNUM_SERVO    = 2;  // FN_AXISNUM type: servo axis count
+const SPMETER_LOAD   = 0;  // FN_SPMETER type: spindle load meter (data_num entry)
+const SPMETER_SPEED  = 1;  // FN_SPMETER type: spindle motor speed
+
+// Every load-meter reading is one 8-byte record; cnc_rdspmeter packs two records
+// per spindle (load meter, then motor speed). The decimal position sits at +6 —
+// the official library decodes it there (it reports dec=0 for a load meter, where
+// the field at +4 would have given 10).
+const LOADELM_STRIDE = 8;
+const SPMETER_STRIDE = 16;
+
 // ── Low-level framing ─────────────────────────────────────────────────────────
 function encap(ftype, payload, fvers = 1) {
     if (ftype === FTYPE_VAR_REQU) {
@@ -97,8 +120,12 @@ function decode8(val) {
     return null;
 }
 
-// ── Parse param/diag response body ───────────────────────────────────────────
-function parseParamBody(data, maxaxis, mode = 'param3') {
+// ── Parse parameter response body (cnc_rdparam3) ─────────────────────────────
+// The `diag` variant of this decoder is gone: it was only ever reached by the
+// cnc_diagnoss load path and was never run against a real response. Diagnostics
+// have a different record layout, so a decoder for them has to be written against
+// captured traffic rather than borrowed from the parameter format.
+function parseParamBody(data, maxaxis) {
     const stride = maxaxis * 4 + 8;
     const r = {};
     for (let pos = 0; pos + 8 <= data.length; pos += stride) {
@@ -110,17 +137,10 @@ function parseParamBody(data, maxaxis, mode = 'param3') {
         for (let n = pos + 8; n < pos + stride; n += 4) {
             const chunk = data.slice(n, n + 4);
             let value;
-            if (mode === 'param3') {
-                if      (valtype === 0) value = chunk[3];
-                else if (valtype === 1) { const b = chunk[3]; value = [7,6,5,4,3,2,1,0].map(i => (b>>i)&1); }
-                else if (valtype === 2) value = chunk.readInt16BE(2);   // fix: last 2 bytes
-                else if (valtype === 3) value = chunk.readInt32BE(0);
-            } else { // diag
-                if      (valtype === 4 || valtype === 0) value = chunk[3];
-                else if (valtype === 1) value = chunk.readInt16BE(2);
-                else if (valtype === 2) value = chunk.readInt32BE(0);
-                else if (valtype === 3) { const b = chunk[3]; value = [7,6,5,4,3,2,1,0].map(i => (b>>i)&1); }
-            }
+            if      (valtype === 0) value = chunk[3];
+            else if (valtype === 1) { const b = chunk[3]; value = [7,6,5,4,3,2,1,0].map(i => (b>>i)&1); }
+            else if (valtype === 2) value = chunk.readInt16BE(2);   // fix: last 2 bytes
+            else if (valtype === 3) value = chunk.readInt32BE(0);
             if (axiscount !== -1) { values.data.push(value); break; }
             else                    values.data.push(value);
         }
@@ -143,6 +163,15 @@ const FOCAS_ERRORS = {
 };
 function focasErrName(code) {
     return FOCAS_ERRORS[String(code)] || 'EW_UNKNOWN';
+}
+
+// Turn a rejected `_reqSingle` result into the message it deserves. Both failure
+// shapes have to name the function and the CNC's reason: an EW_* status is a real
+// answer from the controller and must never be mistaken for "no data".
+function reqErr(fnName, st, detail) {
+    return st.error !== undefined
+        ? `${fnName}: CNC returned ${focasErrName(st.error)} (${st.error})${detail ? ` ${detail}` : ''}`
+        : `${fnName}: malformed or empty response frame`;
 }
 
 // ── Main client class ─────────────────────────────────────────────────────────
@@ -258,10 +287,13 @@ class Focas {
         if (list.length !== t.data.length) return { len: -1 };
         for (let x = 0; x < t.data.length; x++) {
             if (t.data[x].slice(0, 6).equals(list[x].slice(0, 6))) {
+                // Same sub-payload layout as _reqSingle: echo(6) | status(6) | len(2) | data.
+                // The length prefix is stripped here so `data` means the same thing from
+                // both request helpers — reading it as a record count is not possible.
                 const zeros = t.data[x].slice(6, 12).every(b => b === 0);
                 t.data[x] = zeros
-                    ? [0, t.data[x].slice(12)]
-                    : [t.data[x].readInt16BE(0), t.data[x].slice(12)];
+                    ? [0, t.data[x].slice(14)]
+                    : [t.data[x].readInt16BE(6), t.data[x].slice(14)];
             } else {
                 return { len: -1 };
             }
@@ -342,7 +374,7 @@ class Focas {
             st = await this._reqSingle(1, 1, 0x0e, first, last, axis);
         }
         if (st.len <= 0) return null;
-        return parseParamBody(st.data, this.sysinfo.maxaxis, 'param3');
+        return parseParamBody(st.data, this.sysinfo.maxaxis);
     }
 
     async readactfeed() {
@@ -373,11 +405,11 @@ class Focas {
         if (maxmsgs <= 0) maxmsgs = (this.sysinfo && this.sysinfo.maxaxis) || 32;
         const st = await this._reqSingle(1, 1, 0x23, type, maxmsgs, withtext, textlength);
         if (st.len < 0)
-            throw new Error('cnc_rdalmmsg: malformed or empty response frame');
+            throw new Error(reqErr('cnc_rdalmmsg', st));
         if (st.len === 0) {
             // _reqSingle omits `error` entirely for a clean success carrying no data.
             if (st.error !== undefined)
-                throw new Error(`cnc_rdalmmsg: CNC returned ${focasErrName(st.error)} (${st.error}) for type=${type}`);
+                throw new Error(reqErr('cnc_rdalmmsg', st, `for type=${type}`));
             return [];
         }
         const stride = 4 * 4 + textlength;
@@ -423,6 +455,16 @@ class Focas {
         if (cmds.length === 0) return null;
         const st = await this._reqMulti(cmds);
         if (!st || st.len < 0) return null;
+
+        // The CNC sizes every block for the maximum axis count and leaves the slots
+        // past the axes it actually controls undefined — the spec says only "the data
+        // for current controlled axes are valid". Those slots still carry a decimal
+        // flag, so decoding them yields plausible-looking numbers that are not
+        // positions (the official library hands back the same integers at the same
+        // indices and leaves it to the caller not to look at them). Bound the sweep
+        // by the real axis count, never by the buffer length.
+        const recs = axis === ALLAXIS ? await this.readaxiscount(AXNUM_SERVO) : 1;
+
         const result = {};
         let idx = 0;
         for (const a of axvalues) {
@@ -430,9 +472,9 @@ class Focas {
             const d = st.data[idx++];
             if (!d || d[0] !== 0) { result[a.name] = null; continue; }
             const body = d[1];
-            const count = body.readUInt16BE(0);
             const vals = [];
-            for (let p = 2; p < count * 8 + 2; p += 8) vals.push(decode8(body.slice(p, p + 8)));
+            for (let p = 0; p + 8 <= body.length && vals.length < recs; p += 8)
+                vals.push(decode8(body.slice(p, p + 8)));
             result[a.name] = vals;
         }
         return result;
@@ -451,18 +493,71 @@ class Focas {
         return r;
     }
 
-    // ── Servo load (diag 400, per-axis percentage) ────────────────────────────
-    async readservoload() {
-        const st = await this._reqSingle(1, 1, 0x30, 400, 400, ALLAXIS);
-        if (st.len <= 0) return null;
-        const r400 = parseParamBody(st.data, this.sysinfo.maxaxis, 'diag')[400]; return r400 ? r400.data : null;
+    // ── Load meters ───────────────────────────────────────────────────────────
+    // Each 8-byte record holds value(i32 BE) then the decimal position(i16 BE) at +6,
+    // so the reading is value / 10^dec — the official library reports dec=0 for a
+    // load meter (unit: 0 = %, 1 = rpm). The response is always sized for the maximum
+    // axis count, not the live one, and the tail beyond the real axes is stale buffer
+    // contents, so the count from cnc_rdaxisnum — never maxaxis — bounds the loop.
+    _loadReadings(data, stride, count) {
+        const out = [];
+        for (let i = 0; i < count && (i + 1) * stride <= data.length; i++) {
+            const value = data.readInt32BE(i * stride);
+            const dec   = data.readInt16BE(i * stride + 6);
+            out.push(value / Math.pow(10, dec));
+        }
+        return out;
     }
 
-    // ── Spindle load (diag 300, percentage) ──────────────────────────────────
+    async readaxiscount(type) {
+        const st = await this._reqSingle(1, 1, FN_AXISNUM, type);
+        if (st.len < 2) throw new Error(reqErr('cnc_rdaxisnum', st, `for type=${type}`));
+        return st.data.readInt16BE(0);
+    }
+
+    // One record per servo axis, reported as a magnitude.
+    async readsvmeter() {
+        const count = await this.readaxiscount(AXNUM_SERVO);
+        const st = await this._reqSingle(1, 1, FN_SVMETER, 1);
+        if (st.len <= 0) throw new Error(reqErr('cnc_rdsvmeter', st));
+        return this._loadReadings(st.data, LOADELM_STRIDE, count).map(Math.abs);
+    }
+
+    // Two records per spindle (load meter, then motor speed); only the named one is kept.
+    async readspmeter(type = SPMETER_LOAD) {
+        const count = await this.readaxiscount(AXNUM_SPINDLE);
+        const st = await this._reqSingle(1, 1, FN_SPMETER, type, ALLAXIS);
+        if (st.len <= 0) throw new Error(reqErr('cnc_rdspmeter', st, `for type=${type}`));
+        return this._loadReadings(st.data, SPMETER_STRIDE, count);
+    }
+
+    // ── Axis / spindle names ──────────────────────────────────────────────────
+    // 4-byte records with the name in byte 0 ("X", "S"); the remaining bytes are
+    // not useful on the wire.
+    _names(st, count) {
+        if (!st || st.len <= 0) return [];
+        const n = Math.min(count, Math.floor(st.data.length / 4));
+        const out = [];
+        for (let i = 0; i < n; i++)
+            out.push(st.data.slice(i * 4, i * 4 + 4).toString('latin1').split('\0')[0].trim());
+        return out;
+    }
+
+    async readaxisnames(count) {
+        return this._names(await this._reqSingle(1, 1, FN_SVNAME, 0), count);
+    }
+
+    async readspindlenames(count) {
+        return this._names(await this._reqSingle(1, 1, FN_SPNAME, ALLAXIS), count);
+    }
+
+    async readservoload() {
+        return this.readsvmeter();
+    }
+
     async readspindleload() {
-        const st = await this._reqSingle(1, 1, 0x30, 300, 300, ALLAXIS);
-        if (st.len <= 0) return null;
-        const r300 = parseParamBody(st.data, this.sysinfo.maxaxis, 'diag')[300]; return r300 ? r300.data : null;
+        const values = await this.readspmeter();
+        return values.length ? values[0] : null;
     }
 }
 

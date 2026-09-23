@@ -91,6 +91,50 @@ npm install node-red-contrib-fanuc-focas
 | Spindle motor speed | Actual spindle RPM |
 | Actual feedrate | Feedrate in mm/min |
 
+### Position reads
+
+The position sub-types return **one entry per controlled axis**, in axis order, and
+nothing else:
+
+```json
+"absolute_position": { "ABS": [0, 0, 0] }
+```
+
+> The controller sizes a position block for the *maximum* axis count and leaves the slots
+> past the axes it controls undefined. Those slots still carry a decimal flag, so decoding
+> them yields plausible-looking numbers that are not positions — the official library hands
+> back the same integers at the same indices and leaves it to the caller not to read them.
+> The node bounds the array by the controlled-axis count reported by the CNC, so a
+> 3-axis machine gets 3 entries however large the configured maximum is.
+
+### Load meters
+
+Both load meters are read with their own FOCAS functions — `cnc_rdsvmeter` and
+`cnc_rdspmeter` — not from diagnostic data. Both return **one value per axis or spindle**,
+read back as arrays alongside the names they belong to:
+
+```json
+{
+  "servo_load_percent": [12, 7, 31],
+  "servo_load_axes": ["X", "Y", "Z"]
+}
+```
+
+```json
+{
+  "spindle_load_percent": 4,
+  "spindle_load_percents": [4],
+  "spindle_load_names": ["S"]
+}
+```
+
+`servo_load_percent` is an **array, one entry per servo axis**, in the same order as
+`servo_load_axes`. For the spindle the scalar `spindle_load_percent` is the first spindle,
+so a single-spindle flow needs no change, while `spindle_load_percents` carries all of them.
+
+> The number of axes and spindles is read from the controller (`cnc_rdaxisnum`) rather than
+> assumed from the configured maximum, so the arrays are never padded out with unused axes.
+
 ### Timer format
 
 Each timer returns both a machine-readable value and a formatted string:
@@ -281,6 +325,8 @@ No additional npm dependencies — uses only Node.js built-ins (`net`, `Buffer`)
 - **Connection per poll.** A new TCP connection is opened and cleanly closed for each poll cycle, matching the FOCAS session model.
 - The FOCAS wire protocol is reverse-engineered from [`diohpix/pyfanuc`](https://github.com/diohpix/pyfanuc) with several bug fixes applied (valtype-2 unpack, readparam3 fallback guard, statinfo cnctype matching).
 - Wire behaviour is cross-checked against the FANUC FOCAS2 SDK (`lib/FOCAS2 Library/`) — per-function specs in `Document/SpecE/Misc/`, status codes in `Document/SpecE/ERRCODE.HTM`.
+- The load-meter function codes and their record layout were read off the official library's own traffic: the 64-bit SDK is driven over a local TCP proxy and the frames the vendor DLL puts on the wire are decoded (`tools/probe-funcsupport.js` prints the whole opcode support map for a controller). Guessing an opcode is what made the load meters silently report `null` — see `tools/verify-node-load.js`.
+- Opcodes are **per-series**, not universal: `cnc_diagnoss` (0x30) answers `EW_FUNC` on a controller that does not implement it, and `cnc_rdparam3` uses a different code on 16i than on 30i/0i-D. Where a function is optional, the node reports the `EW_*` status instead of degrading to `null`.
 - FOCAS errors are surfaced, not swallowed: a request that the CNC rejects raises (e.g. `cnc_rdalmmsg: CNC returned EW_ATTRIB (4)`). An empty array from `readalarmcode()` therefore means *no alarms*, nothing else.
 
 ---
