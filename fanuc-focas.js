@@ -294,9 +294,11 @@ async function collect(ip, port, cnc_series, fn, subtype, params) {
     const focas    = new Focas(ip, port);
     const runModes = cnc_series === '15' ? RUN_MODES_15 : RUN_MODES_16;
 
-    await focas.connect();
     let result;
     try {
+        // Inside the try: a refused connect must still reach disconnect(), or the
+        // socket sits there holding one of the controller's session slots.
+        await focas.connect();
         switch (fn) {
             case 'status_info':    result = await fnStatusInfo(focas, runModes);   break;
             case 'system_info':    result = await fnSystemInfo(focas);             break;
@@ -343,7 +345,14 @@ module.exports = function(RED) {
             return;
         }
 
-        node.on('input', async function(msg, send, done) {
+        // Polls are serialised per node. Every poll takes a FOCAS session and the
+        // controller allows only a handful of them at once, so two messages handled
+        // concurrently — an inject faster than a poll, or several nodes wired to one
+        // inject — would have the later ones refused. Queueing costs latency on a
+        // backed-up inject, but never drops a message and never opens a second session.
+        let queue = Promise.resolve();
+
+        async function poll(msg, send, done) {
             // Allow overriding function/subtype/params via msg
             const fn      = msg.function  || config.fn      || 'all';
             const subtype = msg.subtype   || config.subtype || 'feedrate';
@@ -360,6 +369,13 @@ module.exports = function(RED) {
                 node.error(err.message, msg);
                 done(err);
             }
+        }
+
+        node.on('input', function(msg, send, done) {
+            // poll() reports through done() and does not reject, so the chain stays
+            // alive; the catch is only a guard against a fault outside its try.
+            queue = queue.then(() => poll(msg, send, done), () => poll(msg, send, done))
+                         .catch(() => {});
         });
 
         node.on('close', () => node.status({}));

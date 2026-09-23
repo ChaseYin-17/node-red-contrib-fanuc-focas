@@ -211,4 +211,8 @@
 
     <h3>Notes</h3>
     <p>FOCAS is strictly sequential. Each node maintains its own TCP connection per poll cycle.</p>
+    <p>The controller accepts only a few concurrent sessions (5 on the machine this was measured
+       against), so a node runs its polls one at a time — a message arriving mid-poll waits its
+       turn instead of colliding. If every session is in use the controller refuses the new one
+       and the node says so, with the raw reply, rather than reporting a generic handshake failure.</p>
 </script>
