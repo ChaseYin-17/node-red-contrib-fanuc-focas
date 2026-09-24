@@ -27,7 +27,12 @@ const FOCAS_ERRORS = {
      '14':'EW_DTSRVR',    '15':'EW_ALARM',    '16':'EW_STOP',   '17':'EW_PASSWD',
 };
 
-// name, c3, args — all reads already used by the node
+// name, c3, args — every read the node issues, plus the load-meter variants it could.
+//
+// There is no row for cnc_rdaxisdata: the 64-bit library has no opcode of its own for
+// it. Captured with tools/probe-dll-opcode.py, cls=2 decomposes into 0xa4 + 0x89 +
+// 0x56[type] — so its servo load meter is the 0x56 row below, and its "load current
+// (Ampere)" is the same opcode with 3 in place of 1. See docs/notes.md.
 const CASES = [
     ['cnc_rdprogdir   (listprog)',        0x06, [1, 0x13, 2]],
     ['cnc_rdmacro     (readmacro)',       0x15, [1, 1]],
@@ -39,7 +44,13 @@ const CASES = [
     ['cnc_rdactfeed   (readactfeed)',     0x24, []],
     ['cnc_rdactspdspeed(readspindlespeed)',0x25, []],
     ['cnc_rddynamic2  (readaxes)',        0x26, [4, -1, 0, 0]],
-    ['DIAG READ        (servoload NOW)',  0x30, [400, 400, -1]],
+    ['cnc_diagnoss    (RETIRED path)',    0x30, [400, 400, -1]],
+    ['cnc_rdspmeter   (spindle load, %)', 0x40, [0, -1]],
+    ['cnc_rdsvmeter   (servo load, %)',   0x56, [1]],
+    ['cnc_rdsvmeter   (load current, A)', 0x56, [3]],
+    ['cnc_rdaxisname  (servo axis names)',0x89, [0]],
+    ['cnc_rdspdlname  (spindle names)',   0x8a, [-1]],
+    ['cnc_rdaxisnum   (servo axcount)',   0xa4, [2]],
     ['cnc_rdparam3     (readparam3)',     0x8d, [6711, 6711, -1]],
     ['cnc_rdparam      (readparam3 fall)',0x0e, [6711, 6711, -1]],
 ];
