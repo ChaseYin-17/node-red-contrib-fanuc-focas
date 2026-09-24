@@ -49,7 +49,8 @@
             { v: 'dist_to_go', l: 'Distance to go' },
         ]},
         { group: 'Servo', options: [
-            { v: 'servo_load', l: 'Servo load meter (percentage)' },
+            { v: 'servo_load',    l: 'Servo load meter (percentage)' },
+            { v: 'servo_current', l: 'Servo load current (Ampere)' },
         ]},
         { group: 'Spindle', options: [
             { v: 'spindle_load',  l: 'Spindle load meter (percentage)' },
@@ -197,8 +198,10 @@
         <dt>Timers</dt><dd>power_on, auto_operation, cutting, cycle — with total_seconds and formatted</dd>
         <dt>Axes Data</dt><dd>Position, servo/spindle load, feedrate — select sub-type.
             Servo load returns one value per axis (<code>servo_load_percent</code>, array) alongside
-            <code>servo_load_axes</code>; spindle load returns <code>spindle_load_percent</code> (first
-            spindle) with <code>spindle_load_percents</code> and <code>spindle_load_names</code>.</dd>
+            <code>servo_load_axes</code>; servo load current returns the same axes in Ampere
+            (<code>servo_load_current_amps</code>); spindle load returns
+            <code>spindle_load_percent</code> (first spindle) with <code>spindle_load_percents</code>
+            and <code>spindle_load_names</code>.</dd>
         <dt>Parameters</dt><dd>Raw parameter values by number</dd>
         <dt>Program Number</dt><dd>Running and main program numbers with comments</dd>
         <dt>Part Count</dt><dd>Required and lifetime total parts</dd>

@@ -85,3 +85,73 @@ sick device cannot slow the others down.
 
 **The change:** bound the queue and drop stale messages, or coalesce duplicates so only the
 newest pending request survives.
+
+---
+
+## Axis load current: cnc_rdaxisdata has no opcode of its own
+
+Measured 2026-09-24 against the same 31i at `192.168.100.128:8193` (cnc_type `31`,
+series `G11Z`, maxaxis 32, 3 servo axes, 1 spindle).
+
+The 64-bit `Fwlib64.dll` is a dispatcher. `cnc_rdaxisdata(cls=2)` — the call that reaches
+the servo load meter and the **load current in Ampere** — does not put a new function code
+on the wire. It decomposes into calls the node already makes:
+
+| `cnc_rdaxisdata` cls=2, `type` | wire |
+|---|---|
+| `0` load meter | `0x56` arg `1` |
+| `1` load current (%) | `0x56` arg `1` |
+| `2` load current (Ampere) | `0x56` arg `3` |
+| `1,2` | `0x56[1]` + `0x56[3]` |
+| `0,1,2` | `0x56[1]` + `0x56[1]` + `0x56[3]` |
+
+Around those it sends `0xa4` (axis count) for the length and `0x89` (axis names) for the
+names; the unit/dec the SDK reports are read off the wire, not filled in from a table.
+
+**So Ampere is reachable with no new opcode** — `0x56` with `3` in place of the `1`
+`readsvmeter()` sends today. The unit sits in the record itself:
+
+| `0x56` arg | `dec` at +6 | unit |
+|---|---|---|
+| `1` | `0` | % |
+| `3` | `2` | Ampere (value / 100) |
+| `0`, `2` | `0x0281` | accepted, but the block does not decode as load records — do not use |
+| `>= 4` | — | `EW_ATTRIB` |
+
+All values read `0` on the 3-axis mill: the machine was idle. The `dec` is taken from the
+wire record and the Ampere identity is corroborated by the SDK's own unit enum (9), but a
+single idle sample cannot separate "amperes" from "the same percentage carried at a finer
+decimal" — both fit the same numbers.
+
+Re-measured 2026-09-24 on the **5-axis lathe at `10.192.232.161:8193`** (axes `X1 Z1 C1 Y1
+T1`), under load. Two polls 1.1 s apart:
+
+| axis | `0x56[1]` % | `0x56[3]` A | A / % |
+|------|-------------|-------------|-------|
+| X1 | 70 | 18.00 | 0.257 |
+| Z1 | 4 | 1.22 | 0.305 |
+| C1 | 0 | 0 | — |
+| Y1 | 50 | 13.17 | 0.263 |
+| T1 | 0 | 0 | — |
+
+Two things follow. The readings are **not the same quantity** — 70 against 18 kills the
+finer-decimal reading of `0x56[3]`, which would have put 70.00 there. And they are
+**proportional through the origin**: X1 and Y1 agree to 2%, Z1 sits inside its own
+quantisation (4% carries ±0.5, so 0.27–0.35), giving **100% of the load meter ≈ 26 A** on
+these axes. A pair taken seven minutes earlier read 17.98 / 1.19 / 13.23 A, so the scale is
+stable across time, not noise.
+
+That is the shape a real current reading has. What it cannot show is whether 26 A is the
+axes' *rated* current or a peak/stall reference — the normalising base is a motor and
+parameter property that these samples do not reveal. **Check the implied 26 A against the
+servo motor nameplate to close the absolute scale.**
+
+**Capturing this again:** `tools/probe-dll-opcode.py` drives the vendor DLL through a local
+TCP proxy and hexdumps both directions. `cnc_rdsvmeter` runs first as a control — its
+opcode is already known to be `0x56`, so a capture that does not show `0x56` is lying about
+something and the rest of its output is worthless. The DLL answers `EW_NODLL (-15)` unless
+the series drivers (`fwlib30i64.dll`, …) are preloaded by absolute path — the dispatcher
+looks them up by bare name, and a bare name does not search `AddDllDirectory` paths.
+
+`tools/probe-funcsupport.js` carries the `0x56` arg `1`/`3` rows, so the controller answers
+both without needing the vendor DLL.

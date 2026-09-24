@@ -223,6 +223,16 @@ async function fnAxesData(focas, axisType) {
                 servo_load_axes:    await focas.readaxisnames(loads.length),
             };
         }
+        case 'servo_current': {
+            // Same opcode as the load meter, read with the selector that makes the
+            // controller answer in Ampere. Reported as a magnitude like the per-cent
+            // array, so a regenerating axis reads positive here too.
+            const amps = await focas.readservocurrent();
+            return {
+                servo_load_current_amps: amps,
+                servo_load_axes:         await focas.readaxisnames(amps.length),
+            };
+        }
         case 'abs_pos':
             return { absolute_position: await focas.readaxes(1) };
         case 'rel_pos':

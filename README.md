@@ -132,6 +132,21 @@ read back as arrays alongside the names they belong to:
 `servo_load_axes`. For the spindle the scalar `spindle_load_percent` is the first spindle,
 so a single-spindle flow needs no change, while `spindle_load_percents` carries all of them.
 
+Selecting **Servo load current** reads the same axes in Ampere:
+
+```json
+{
+  "servo_load_current_amps": [1.85, 0.42, 3.07],
+  "servo_load_axes": ["X", "Y", "Z"]
+}
+```
+
+It is the same FOCAS call the per-cent meter uses, with the load-current selector, so both
+are magnitudes — a regenerating axis reads positive in either. The controller reports the
+scale alongside the value (decimal 0 for per cent, 2 for Ampere) and the node applies it.
+`cnc_rdaxisdata`, the SDK call that also exposes this reading, has no opcode of its own;
+see `docs/notes.md` for how the vendor library reaches it.
+
 > The number of axes and spindles is read from the controller (`cnc_rdaxisnum`) rather than
 > assumed from the configured maximum, so the arrays are never padded out with unused axes.
 

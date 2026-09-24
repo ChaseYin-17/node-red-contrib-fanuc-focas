@@ -42,6 +42,14 @@ const AXNUM_SERVO    = 2;  // FN_AXISNUM type: servo axis count
 const SPMETER_LOAD   = 0;  // FN_SPMETER type: spindle load meter (data_num entry)
 const SPMETER_SPEED  = 1;  // FN_SPMETER type: spindle motor speed
 
+// FN_SVMETER carries a reading selector in its first argument. 1 is the documented
+// cnc_rdsvmeter (load meter, %); 3 is the load current in Ampere that the vendor
+// library reaches through cnc_rdaxisdata(cls=2, type=2) — that function has no
+// opcode of its own, it decomposes into this one. See docs/notes.md. The two
+// differ only in the scale the controller reports alongside the value.
+const SVMETER_LOAD    = 1; // FN_SVMETER reading: load meter / load current (%)
+const SVMETER_CURRENT = 3; // FN_SVMETER reading: load current (Ampere)
+
 // Every load-meter reading is one 8-byte record; cnc_rdspmeter packs two records
 // per spindle (load meter, then motor speed). The decimal position sits at +6 —
 // the official library decodes it there (it reports dec=0 for a load meter, where
@@ -593,11 +601,13 @@ class Focas {
         return st.data.readInt16BE(0);
     }
 
-    // One record per servo axis, reported as a magnitude.
-    async readsvmeter() {
+    // One record per servo axis, reported as a magnitude. The reading selector picks the
+    // unit and the controller reports the matching decimal position with it — LOAD gives
+    // dec 0 (per cent), CURRENT gives dec 2, so the Ampere value arrives as a hundredth.
+    async readsvmeter(reading = SVMETER_LOAD) {
         const count = await this.readaxiscount(AXNUM_SERVO);
-        const st = await this._reqSingle(1, 1, FN_SVMETER, 1);
-        if (st.len <= 0) throw new Error(reqErr('cnc_rdsvmeter', st));
+        const st = await this._reqSingle(1, 1, FN_SVMETER, reading);
+        if (st.len <= 0) throw new Error(reqErr('cnc_rdsvmeter', st, `for reading=${reading}`));
         return this._loadReadings(st.data, LOADELM_STRIDE, count).map(Math.abs);
     }
 
@@ -631,6 +641,10 @@ class Focas {
 
     async readservoload() {
         return this.readsvmeter();
+    }
+
+    async readservocurrent() {
+        return this.readsvmeter(SVMETER_CURRENT);
     }
 
     async readspindleload() {
