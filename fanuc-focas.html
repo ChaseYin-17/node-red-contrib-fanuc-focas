@@ -64,7 +64,7 @@
     // Functions that need no extra config
     const FANUC_SIMPLE_FNS = new Set([
         'status_info','system_info','timers','program_number',
-        'part_count','alarm_messages','all'
+        'part_count','tool_life','alarm_messages','all'
     ]);
 
     RED.nodes.registerType('fanuc-focas', {
@@ -92,6 +92,7 @@
                 parameters:     'Parameters',
                 program_number: 'Program Number',
                 part_count:     'Part Count',
+                tool_life:      'Tool Life',
                 alarm_messages: 'Alarm Messages',
                 macro:          'Macro',
             }[this.fn] || this.fn;
@@ -162,6 +163,7 @@
             <option value="parameters">Parameters</option>
             <option value="program_number">Program Number</option>
             <option value="part_count">Part Count</option>
+            <option value="tool_life">Tool Life</option>
             <option value="alarm_messages">Alarm Messages</option>
             <option value="macro">Macro</option>
             </optgroup>
@@ -205,6 +207,10 @@
         <dt>Parameters</dt><dd>Raw parameter values by number</dd>
         <dt>Program Number</dt><dd>Running and main program numbers with comments</dd>
         <dt>Part Count</dt><dd>Required and lifetime total parts</dd>
+        <dt>Tool Life</dt><dd>Per tool group: tool count, life set, counter used, remaining
+            and usage percent, plus the in-use / next / selected group. Needs the CNC's
+            <em>tool life management</em> option — without it the node reports the
+            controller's <code>EW_NOOPT</code>.</dd>
         <dt>Alarm Messages</dt><dd>Active alarms with type, code, axis, text</dd>
         <dt>Macro</dt><dd>Custom macro variable values by number</dd>
     </dl>

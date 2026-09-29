@@ -67,7 +67,7 @@ npm install node-red-contrib-fanuc-focas
 
 | Function | Description | `msg.payload` fields |
 |----------|-------------|----------------------|
-| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `active_alarms`, `errors` |
+| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `axes_data`, `tool_life`, `active_alarms`, `errors` |
 | **Status Info** | Machine run state | `mode`, `run_state`, `motion`, `mstb`, `emergency`, `alarm`, `edit` |
 | **System Info** | Controller identity | `cnc_type`, `mt_type`, `series`, `version`, `axes` |
 | **Timers** | Accumulated time counters | `power_on_time`, `auto_operation_time`, `cutting_time`, `cycle_time` |
@@ -75,6 +75,7 @@ npm install node-red-contrib-fanuc-focas
 | **Parameters** | Raw CNC parameters | `{ [param_number]: value, … }` |
 | **Program Number** | Active program | `running_program`, `main_program`, `running_comment`, `main_comment` |
 | **Part Count** | Parts produced | `required_parts`, `lifetime_total` |
+| **Tool Life** | Per-group tool life | `group_count`, `using_group`, `groups[]`, `most_used_group`, … |
 | **Alarm Messages** | Active alarms | Array of `{ type, type_code, code, axis, text }` |
 | **Macro** | Custom macro variables | `{ [macro_number]: value, … }` |
 
@@ -192,6 +193,67 @@ When **Function** is `Alarm Messages` the payload is an **array**, with the poll
 attached as a property (not visible when the array is JSON-serialised). Other functions return
 an object containing `timestamp`.
 
+### Tool life
+
+**Tool Life** reads the CNC's tool-life management: one entry per registered tool group,
+plus the group the machine is currently working through.
+
+```json
+{
+  "group_count": 3,
+  "max_group": 128,
+  "max_tool": 24,
+  "max_minute": 9999,
+  "max_cycle": 9999,
+  "using_group": 2,
+  "next_group": 3,
+  "selected_group": 2,
+  "groups": [
+    {
+      "group": 1,
+      "tool_count": 6,
+      "life": 500,
+      "counter": 412,
+      "remaining": 88,
+      "usage_percent": 82.4,
+      "count_type": 0,
+      "unit": "count",
+      "in_use": false,
+      "life_rest_raw": 0
+    }
+  ],
+  "most_used_group": 1,
+  "timestamp": "2026-09-28T07:35:23.213Z"
+}
+```
+
+> `count_type` is **per group** — `0` counts parts, `1` counts minutes — so each group
+> carries its own `unit`. `remaining` prefers the CNC's own rest counter when it reports
+> one (tool life management B; the value the change decision uses) and otherwise falls
+> back to `life − counter`; the raw value is kept as `life_rest_raw`. A group with no life
+> set (`life: 0`) gets `remaining: null` and `usage_percent: null`, never `0` — "0
+> remaining" would read as a spent tool and "0%" as plenty left. Groups with no tools
+> registered are skipped.
+>
+> **Needs the CNC's tool life management option.** Without it the controller answers
+> `EW_NOOPT (6)`, the poll raises, and the node reports it — rather than returning an
+> empty tool table that looks like "no tools".
+>
+> The wire layout is *not* the SDK's C struct: fields are widened to 4-byte longs, `cnc_rdngrp`
+> and `cnc_rdtlinfo` return the same 20-byte block, and `cnc_rdusegrpid` returns only three
+> longs. The offsets were corrected against a controller with the option on; see
+> [`docs/notes.md`](docs/notes.md). `node tools/probe-toollife.js <ip>` dumps the raw payloads.
+>
+> Groups are read a page at a time: the controller refuses a single oversized
+> `cnc_rdgrpinfo4` (measured ceiling `num_to_read = 103`), so the node pages through with
+> `grp_no` instead of asking for every group in one call.
+>
+> The limits and the group count are read with `cnc_rdtlinfo` / `cnc_rdngrp` /
+> `cnc_rdusegrpid`, and are **best effort**: if one fails the payload still comes back with
+> that part zeroed, and the reason is recorded under `tool_life.errors` (keyed by the call
+> that failed). Only `cnc_rdgrpinfo4` is required — without the option it is what raises
+> `EW_NOOPT`.
+
 ### Partial failures — All Data
 
 `All Data` reads every field independently, so one failing function degrades **only that field**
@@ -213,6 +275,10 @@ The rules:
 - A field that could not be read is **`null`**, and the reason appears in `errors` under the
   same key (the field name, or `actual_feedrate_mm_min` / `actual_spindle_rpm` for the two
   feedrate-spindle values).
+- `axes_data` and `tool_life` are each **one field**: every sub-read they make is part of the
+  same key, so a single failure degrades the whole block to `null` with one `errors` entry.
+  On a machine without the tool-life option that is how `tool_life` reads —
+  `null` plus `"tool_life": "cnc_rdgrpinfo4: CNC returned EW_NOOPT (6)"`.
 - `errors` is `{}` when every field read cleanly.
 - `active_alarms` is **`null` when the alarm read failed** and **`[]` when the controller
   answered but has no active alarms** — the two are deliberately distinguishable.
@@ -260,6 +326,34 @@ The rules:
   "feedrate_spindle": {
     "actual_feedrate_mm_min": 24000,
     "actual_spindle_rpm": 101
+  },
+  "axes_data": {
+    "absolute_position": { "ABS": [0, 0, 0] },
+    "machine_position": { "REF": [0, 0, 0] },
+    "relative_position": { "REL": [0, 0, 0] },
+    "distance_to_go": { "DIST": [0, 0, 0] },
+    "servo_load_percent": [12, 7, 31],
+    "servo_load_axes": ["X", "Y", "Z"],
+    "spindle_load_percent": 4,
+    "spindle_load_percents": [4],
+    "spindle_load_names": ["S"],
+    "servo_load_current_amps": [1.85, 0.42, 3.07]
+  },
+  "tool_life": {
+    "group_count": 3,
+    "max_group": 128,
+    "max_tool": 24,
+    "max_minute": 9999,
+    "max_cycle": 9999,
+    "using_group": 2,
+    "next_group": 3,
+    "selected_group": 2,
+    "groups": [
+      { "group": 1, "tool_count": 6, "life": 500, "counter": 412, "remaining": 88,
+        "usage_percent": 82.4, "count_type": 0, "unit": "count", "in_use": false,
+        "life_rest_raw": 0 }
+    ],
+    "most_used_group": 1
   },
   "active_alarms": [],
   "errors": {},
@@ -344,6 +438,7 @@ No additional npm dependencies — uses only Node.js built-ins (`net`, `Buffer`)
 - Wire behaviour is cross-checked against the FANUC FOCAS2 SDK (`lib/FOCAS2 Library/`) — per-function specs in `Document/SpecE/Misc/`, status codes in `Document/SpecE/ERRCODE.HTM`.
 - The load-meter function codes and their record layout were read off the official library's own traffic: the 64-bit SDK is driven over a local TCP proxy and the frames the vendor DLL puts on the wire are decoded (`tools/probe-funcsupport.js` prints the whole opcode support map for a controller). Guessing an opcode is what made the load meters silently report `null` — see `tools/verify-node-load.js`.
 - Opcodes are **per-series**, not universal: `cnc_diagnoss` (0x30) answers `EW_FUNC` on a controller that does not implement it, and `cnc_rdparam3` uses a different code on 16i than on 30i/0i-D. Where a function is optional, the node reports the `EW_*` status instead of degrading to `null`.
+- The tool-life function codes were read off the vendor library the same way — `0x48` `cnc_rdusegrpid`, `0x4a` `cnc_rdngrp`, `0x1c1` `cnc_rdgrpinfo4`, `0x1c4` `cnc_rdtlinfo`. The wire offsets were then pinned against a controller with the option on (see [`docs/notes.md`](docs/notes.md)). `tools/verify-node-toollife-offline.js` guards the decode, the record model and the paging loop with **no hardware** (35 checks); `tools/verify-node-toollife.js` checks it end to end against a real controller.
 - FOCAS errors are surfaced, not swallowed: a request that the CNC rejects raises (e.g. `cnc_rdalmmsg: CNC returned EW_ATTRIB (4)`). An empty array from `readalarmcode()` therefore means *no alarms*, nothing else.
 - Measured limits of the controllers this has been run against, and the changes deliberately put off for now, are kept in [`docs/notes.md`](docs/notes.md).
 

@@ -1,13 +1,22 @@
 'use strict';
-let Focas, ALLAXIS;
+let Focas, ALLAXIS, TOOL_GROUP_PAGE;
 try {
     const m = require('./focas');
-    Focas   = m.Focas;
-    ALLAXIS = m.ALLAXIS;
+    Focas           = m.Focas;
+    ALLAXIS         = m.ALLAXIS;
+    TOOL_GROUP_PAGE = m.TOOL_GROUP_PAGE;
     if (typeof Focas !== 'function') {
         throw new Error(
             `focas.js exported Focas as '${typeof Focas}' (expected a class). ` +
             `Ensure focas.js is in the same directory as fanuc-focas.js.`
+        );
+    }
+    // fnToolLife pages on this; an older focas.js without it would leave the page loop
+    // comparing against undefined and never terminating.
+    if (typeof TOOL_GROUP_PAGE !== 'number') {
+        throw new Error(
+            `focas.js exported TOOL_GROUP_PAGE as '${typeof TOOL_GROUP_PAGE}' (expected a number). ` +
+            `focas.js and fanuc-focas.js are out of sync — update them together.`
         );
     }
 } catch (e) {
@@ -172,6 +181,102 @@ async function fnPartCount(focas) {
     };
 }
 
+// ── Tool life ─────────────────────────────────────────────────────────────────
+// One entry per tool group, with the raw values kept alongside the derived ones.
+// Remaining life prefers the CNC's own rest counter when it reports one: with tool
+// life management B it is the value the change decision actually uses and can differ
+// from life-counter. Without B (or on a T series) the spec says life_rest is always
+// 0, so it falls back to life-counter. A group with no life set (0) gets null, not
+// 0, for both remaining and usage — "0 remaining" would read as a spent tool.
+function makeToolGroup(g, usingGroup) {
+    const life    = g.count_value;
+    const counter = g.counter;
+    return {
+        group:         g.grp_no,
+        tool_count:    g.n_tool,
+        life,
+        counter,
+        remaining:     life > 0
+            ? (g.life_rest > 0 ? g.life_rest : Math.max(0, life - counter))
+            : null,
+        usage_percent: life > 0 ? Math.min(100, Math.max(0, counter * 100 / life)) : null,
+        count_type:    g.count_type,
+        unit:          g.count_type === 1 ? 'minute' : 'count',
+        in_use:        usingGroup === g.grp_no,
+        life_rest_raw: g.life_rest,
+    };
+}
+
+// The group closest to needing a change. Null unless some group has actually been used:
+// a group with no life set has a null usage, and one with life set but never used sits at
+// 0% — naming either as "most used" would point at a freshly loaded tool.
+function pickMostUsedGroup(groups) {
+    let best = null;
+    let bestUsage = 0;
+    for (const g of groups) {
+        if (g.usage_percent === null || g.usage_percent <= bestUsage) continue;
+        bestUsage = g.usage_percent;
+        best = g.group;
+    }
+    return best;
+}
+
+// Tool-life overview (cnc_rdgrpinfo4 + cnc_rdtlinfo + cnc_rdngrp + cnc_rdusegrpid).
+// Needs the CNC's "tool life management" option; without it the per-group read is
+// what surfaces EW_NOOPT. The limits and the group count are display aids, so a
+// failure there falls back to zero rather than sinking the whole item — the reason is
+// recorded in `errors` so a zero is never mistaken for a reading that was not taken.
+async function fnToolLife(focas) {
+    const errors = {};
+    let info = { max_group: 0, max_tool: 0, max_minute: 0, max_cycle: 0 };
+    let groupCount = 0;
+    let use = { next: 0, use: 0, slct: 0 };
+
+    try { info = await focas.readtlinfo(); }    catch (e) { errors.readtlinfo   = e.message || String(e); }
+    try { groupCount = await focas.readngrp(); } catch (e) { errors.readngrp     = e.message || String(e); }
+    try { use = await focas.readusegrpid(); }   catch (e) { errors.readusegrpid = e.message || String(e); }
+
+    const usingGroup = use.use > 0 ? use.use : null;
+
+    // Read every registered group a page at a time. The controller rejects a single large
+    // cnc_rdgrpinfo4 (see TOOL_GROUP_PAGE) and its capacity is not known up front, so one
+    // big block would fail on some machines and miss groups on others. Each stop matters:
+    // an empty or short page is the last one; reaching the reported group count means we
+    // are done; a page that does not move grpNo forward means the controller ignored it
+    // (looping would repeat the same page forever); and stepping past max_group would be
+    // answered with EW_NUMBER.
+    const raw = [];
+    const maxGroup = info.max_group > 0 ? info.max_group : Infinity;
+    for (let grpNo = 1; ;) {
+        const page = await focas.readgrpinfo4(grpNo);
+        if (page.length === 0) break;
+        raw.push(...page);
+        if (page.length < TOOL_GROUP_PAGE) break;
+        if (groupCount > 0 && raw.length >= groupCount) break;
+        const last = page[page.length - 1].grp_no;
+        if (last + 1 <= grpNo || last + 1 > maxGroup) break;
+        grpNo = last + 1;
+    }
+
+    const groups = raw
+        .filter(g => g.n_tool > 0)          // a group with no tools has no life to report
+        .map(g => makeToolGroup(g, usingGroup));
+
+    return {
+        group_count:     groupCount,
+        max_group:       info.max_group,
+        max_tool:        info.max_tool,
+        max_minute:      info.max_minute,
+        max_cycle:       info.max_cycle,
+        using_group:     usingGroup,
+        next_group:      use.next > 0 ? use.next : null,
+        selected_group:  use.slct > 0 ? use.slct : null,
+        groups,
+        most_used_group: pickMostUsedGroup(groups),
+        errors,
+    };
+}
+
 async function fnAlarmMessages(focas, cncSeries) {
     const group = almSeriesGroup(focas, cncSeries);
     const types = ALM_TYPES_BY_GROUP[group];
@@ -246,6 +351,21 @@ async function fnAxesData(focas, axisType) {
     }
 }
 
+// Every axes reading All Data carries, in one block. Feedrate and spindle speed are left
+// out: they already have their own fields under feedrate_spindle.
+const AXES_SUBTYPES_ALL = [
+    'abs_pos', 'machine_pos', 'rel_pos', 'dist_to_go',
+    'servo_load', 'spindle_load', 'servo_current',
+];
+
+async function fnAxesDataAll(focas) {
+    const out = {};
+    for (const subtype of AXES_SUBTYPES_ALL) {
+        Object.assign(out, (await fnAxesData(focas, subtype)) || {});
+    }
+    return out;
+}
+
 async function fnParameters(focas, paramNums) {
     // paramNums is a comma-separated string of parameter numbers
     const nums = String(paramNums).split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
@@ -286,6 +406,8 @@ async function fnAll(focas, runModes, cncSeries) {
     const alarms  = await read('active_alarms',      () => fnAlarmMessages(focas, cncSeries));
     const feed    = await read('actual_feedrate_mm_min', () => focas.readactfeed());
     const spindle = await read('actual_spindle_rpm',     () => focas.readactspindlespeed());
+    const axes    = await read('axes_data',          () => fnAxesDataAll(focas));
+    const tlife   = await read('tool_life',          () => fnToolLife(focas));
 
     return {
         controller:       sysinfo,
@@ -294,6 +416,8 @@ async function fnAll(focas, runModes, cncSeries) {
         timers,
         part_count:       parts,
         feedrate_spindle: { actual_feedrate_mm_min: feed, actual_spindle_rpm: spindle },
+        axes_data:        axes,
+        tool_life:        tlife,
         active_alarms:    alarms,
         errors,
     };
@@ -315,6 +439,7 @@ async function collect(ip, port, cnc_series, fn, subtype, params) {
             case 'timers':         result = await fnTimers(focas);                 break;
             case 'program_number': result = await fnProgramNumber(focas);          break;
             case 'part_count':     result = await fnPartCount(focas);              break;
+            case 'tool_life':      result = await fnToolLife(focas);               break;
             case 'alarm_messages': result = await fnAlarmMessages(focas, cnc_series); break;
             case 'axes_data':      result = await fnAxesData(focas, subtype);      break;
             case 'parameters':     result = await fnParameters(focas, params);     break;

@@ -19,8 +19,9 @@ WHY THIS EXISTS
     trustworthy either.
 
 READ-ONLY
-    cnc_sysinfo / cnc_rdsvmeter / cnc_rdaxisdata only read. Nothing here writes
-    to the controller.
+    cnc_sysinfo / cnc_rdsvmeter / cnc_rdaxisdata and the four tool-life reads
+    (cnc_rdngrp / cnc_rdtlinfo / cnc_rdusegrpid / cnc_rdgrpinfo4) only read.
+    Nothing here writes to the controller.
 
 Usage:
     python tools/probe-dll-opcode.py [ip] [port] [listen_port]
@@ -154,6 +155,27 @@ class ODBSVLOAD(ctypes.Structure):
     _fields_ = [('svload', LOADELM)]
 
 
+class ODBTLIFE2(ctypes.Structure):
+    _fields_ = [('dummy', ctypes.c_short * 2), ('data', ctypes.c_long)]
+
+
+class ODBTLINFO(ctypes.Structure):
+    _fields_ = [('max_group', ctypes.c_long), ('max_tool', ctypes.c_long),
+                ('max_minute', ctypes.c_long), ('max_cycle', ctypes.c_long)]
+
+
+class IODBTGI4(ctypes.Structure):
+    _fields_ = [('grp_no', ctypes.c_short), ('n_tool', ctypes.c_long),
+                ('count_value', ctypes.c_long), ('counter', ctypes.c_long),
+                ('count_type', ctypes.c_long), ('opt_grpno', ctypes.c_long),
+                ('life_rest', ctypes.c_long)]
+
+
+class ODBUSEGR(ctypes.Structure):
+    _fields_ = [('datano', ctypes.c_short), ('type', ctypes.c_short),
+                ('next', ctypes.c_long), ('use', ctypes.c_long), ('slct', ctypes.c_long)]
+
+
 class ODBAXDT(ctypes.Structure):
     _fields_ = [('name', ctypes.c_char * 4), ('data', ctypes.c_long),
                 ('dec', ctypes.c_short), ('unit', ctypes.c_short),
@@ -198,6 +220,20 @@ def bind(fw):
                                   ctypes.POINTER(ctypes.c_short), ctypes.c_short,
                                   ctypes.POINTER(ctypes.c_short),
                                   ctypes.POINTER(ODBAXDT)]
+    for name, argtypes in [
+        ('cnc_rdngrp',     [ctypes.c_ushort, ctypes.POINTER(ODBTLIFE2)]),
+        ('cnc_rdtlinfo',   [ctypes.c_ushort, ctypes.POINTER(ODBTLINFO)]),
+        ('cnc_rdusegrpid', [ctypes.c_ushort, ctypes.POINTER(ODBUSEGR)]),
+        ('cnc_rdgrpinfo4', [ctypes.c_ushort, ctypes.c_short, ctypes.c_short,
+                            ctypes.c_short, ctypes.POINTER(ctypes.c_short),
+                            ctypes.POINTER(IODBTGI4)]),
+    ]:
+        fn = getattr(fw, name, None)
+        if fn is None:
+            print('  !! %s not exported' % name)
+            continue
+        fn.restype = ctypes.c_short
+        fn.argtypes = argtypes
 
 
 def h(title):
@@ -263,6 +299,37 @@ def main():
                 nm = d.name.split(b'\0')[0].decode('latin1')
                 print('    type=%-2d %-4s data=%-10d dec=%-3d unit=%-3d flag=0x%04x'
                       % (t_val, nm, d.data, d.dec, d.unit, d.flag & 0xffff))
+
+    # ── TARGET: tool life (needs the CNC's tool-life-management option) ───────
+    # Without the option all four answer EW_NOOPT (6). The request frame still
+    # shows the opcode — that is what focas.js carries — but the response has no
+    # struct to decode. The wire layout is pinned (see docs/notes.md), so run this
+    # on a controller WITH the option to compare the DLL's decode against it.
+    h('TARGET — tool life (cnc_rdngrp / cnc_rdtlinfo / cnc_rdusegrpid / cnc_rdgrpinfo4)')
+
+    ngrp = ODBTLIFE2()
+    ret = fw.cnc_rdngrp(handle, ctypes.byref(ngrp))
+    print('\n  cnc_rdngrp → %s   data=%d' % (err_name(ret), ngrp.data))
+
+    info = ODBTLINFO()
+    ret = fw.cnc_rdtlinfo(handle, ctypes.byref(info))
+    print('  cnc_rdtlinfo → %s   max_group=%d max_tool=%d max_minute=%d max_cycle=%d'
+          % (err_name(ret), info.max_group, info.max_tool, info.max_minute, info.max_cycle))
+
+    use = ODBUSEGR()
+    ret = fw.cnc_rdusegrpid(handle, ctypes.byref(use))
+    print('  cnc_rdusegrpid → %s   next=%d use=%d slct=%d'
+          % (err_name(ret), use.next, use.use, use.slct))
+
+    nread = ctypes.c_short(0)
+    buf = (IODBTGI4 * 10)()
+    ret = fw.cnc_rdgrpinfo4(handle, 1, 0, 10, ctypes.byref(nread), buf)
+    print('  cnc_rdgrpinfo4 → %s   num_read=%d' % (err_name(ret), nread.value))
+    for i in range(min(nread.value, 10)):
+        g = buf[i]
+        print('    grp=%-4d n_tool=%-3d life=%-6d counter=%-6d type=%-2d opt=%-3d rest=%d'
+              % (g.grp_no, g.n_tool, g.count_value, g.counter,
+                 g.count_type, g.opt_grpno, g.life_rest))
 
     h('Closing')
     ret = fw.cnc_freelibhndl(handle)

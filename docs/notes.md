@@ -155,3 +155,81 @@ looks them up by bare name, and a bare name does not search `AddDllDirectory` pa
 
 `tools/probe-funcsupport.js` carries the `0x56` arg `1`/`3` rows, so the controller answers
 both without needing the vendor DLL.
+
+---
+
+## Tool life: opcodes and wire layout
+
+Opcodes measured 2026-09-28 against the 31i at `192.168.100.128:8193` (cnc_type `31`,
+series `G11Z`); the response layout was pinned the next day on the 31i at
+`10.192.233.33:8193` (series `G103`), which has the tool-life option enabled.
+
+Four calls make up tool-life management. None of their function codes are in the SDK
+headers, so they were read off the vendor library's own traffic with
+`tools/probe-dll-opcode.py`, the same way the load meters were:
+
+| call | wire func | request args |
+|---|---|---|
+| `cnc_rdusegrpid` | `0x48` | — |
+| `cnc_rdngrp`     | `0x4a` | — |
+| `cnc_rdgrpinfo4` | `0x1c1` | `grp_no`, `direction`, `num_to_read` |
+| `cnc_rdtlinfo`   | `0x1c4` | — |
+
+Re-issued over raw TCP from `focas.js`, the **controller answers all four with
+`EW_NOOPT (6)`** — the request frames are right, but this machine does not have the
+*刀具寿命管理* (tool life management) option enabled, so there is no success payload to
+decode. `cnc_rdgrpinfo4`'s arguments were read straight off the wire (`grp_no=1`,
+`direction=0`, `num_to_read=0x0a`), so the request side is settled.
+
+**The response layout is not the SDK struct.** Seen on a controller with the option on, the
+wire widens every field to a 4-byte long:
+
+| call | wire |
+|---|---|
+| `cnc_rdngrp` | `long group_count` at **+0** — the C struct's `dummy[2]` offset (+4) is where `max_group` actually lands |
+| `cnc_rdtlinfo` | one leading long, then `max_group`, `max_tool`, `max_minute`, `max_cycle` at **+4/+8/+12/+16** |
+| `cnc_rdgrpinfo4` | 7 × long per record — `grp_no`, `n_tool`, `life`, `counter`, `count_type`, `opt_grpno`, `life_rest` (the C `short grp_no` + 2-byte pad become one long) |
+| `cnc_rdusegrpid` | 12 bytes: `[next][use][slct]` — `datano`/`type` are documented "not used" and are not sent |
+
+`cnc_rdngrp` and `cnc_rdtlinfo` return the **same 20-byte block** — the group count sits in
+front of the limits, which is why the two calls appeared to disagree:
+
+```
+00 00 00 1e  00 00 00 80  00 00 00 08  00 00 ea 60  05 f5 e0 ff
+     30           128           8          60000       99999999
+```
+
+The mistake this replaced: `focas.js` read the C-struct offsets, so it reported
+`group_count = 128` and `max_group = 30` — two adjacent longs swapped by the missing leading
+field — and decoded every group number as `0`, a `short` read of a `long` `grp_no`. That is
+why `most_used_group` came back as `0` instead of `13`: all 30 groups had collapsed onto
+group number `0`. Separately, `cnc_rdusegrpid`'s 12-byte reply tripped `readusegrpid`'s
+16-byte assumption; `fnToolLife`'s non-fatal `try/catch` swallowed the throw, so
+`using_group`/`next_group`/`selected_group` were silently `null` rather than erroring.
+
+**`life_rest` vs `life − counter`.** `makeToolGroup` prefers `life_rest` when it is `> 0` and
+otherwise falls back to `life − counter`, matching `FanucCnc.ToolLifeCore`. FanucBlazor's
+README says the opposite ("compute `life − counter`, do not trust `life_rest`") — the C# code
+is the one that counts; the prose is stale. The two behave identically on any controller
+without tool-life management B, where `life_rest` is always 0.
+
+**A large `num_to_read` is refused, not clamped.** Measured on the same controller:
+`cnc_rdgrpinfo4` is answered normally up to `num_to_read = 103`; from `104` up the reply is
+frame type `0x2103` (not the usual `0x2102`) carrying `EW_PROTOCOL (-17)`. `_reqSingle`
+surfaces that as `unexpected reply frame 0x2103` with the head bytes, rather than reporting
+it as a malformed frame. The vendor DLL never hits this — it quietly lowers
+the request to `51`. The ceiling is undocumented and there is no call that reports it, so
+`focas.js` reads groups in pages of `TOOL_GROUP_PAGE` (64) and advances `grp_no`, rather
+than asking for one large block.
+
+**Capturing this again:** `python tools/probe-dll-opcode.py <ip> 8193` decodes the four
+calls through the vendor DLL and hexdumps both directions; `node tools/probe-toollife.js
+<ip>` dumps the raw payloads the node itself sees, with an int32/int16 view of every
+offset. `node tools/verify-node-toollife.js <ip>` checks the decoded model end to end. On a
+controller without the option the verify script reports `EW_NOOPT` instead of failing, so
+the decode path is simply not exercised there.
+
+`node tools/verify-node-toollife-offline.js` needs no controller at all — it stubs the
+socket and drives the real node code, covering the wire offsets, the per-group model, the
+paging loop's four stop conditions and the three `reqErr` failure shapes. Run it on any
+change to the decoders or the page loop.
