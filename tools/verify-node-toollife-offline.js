@@ -259,6 +259,10 @@ async function allData() {
           'axes_data carries the spindle names');
     check(p.tool_life && p.tool_life.group_count === 2 && p.tool_life.using_group === 2,
           `tool_life present (group_count = ${p.tool_life && p.tool_life.group_count})`);
+    const keys = Object.keys(p.axes_data || {});
+    check(keys.indexOf('servo_load_current_amps') > keys.indexOf('servo_load_percent') &&
+          keys.indexOf('servo_load_current_amps') < keys.indexOf('spindle_load_percent'),
+          `servo readings sit together: ${keys.join(', ')}`);
     check(p.feedrate_spindle && 'actual_feedrate_mm_min' in p.feedrate_spindle, 'feedrate_spindle kept');
     check(p.errors && Object.keys(p.errors).length === 0, 'no fields degraded');
 }
