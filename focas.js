@@ -57,6 +57,33 @@ const SVMETER_CURRENT = 3; // FN_SVMETER reading: load current (Ampere)
 const LOADELM_STRIDE = 8;
 const SPMETER_STRIDE = 16;
 
+// ── Tool-life function codes ──────────────────────────────────────────────────
+// Captured from the vendor library's own traffic with tools/probe-dll-opcode.py —
+// like the load meters, these are not in the SDK headers. All four sit behind the
+// CNC's "tool life management" option: without it the controller still answers the
+// request (so the opcode is right) with EW_NOOPT (6) instead of an empty table.
+const FN_RDUSEGRPID = 0x48;    // cnc_rdusegrpid — in-use / next / selected group
+const FN_RDNGRP     = 0x4a;    // cnc_rdngrp     — groups with >=1 tool registered
+const FN_RDGRPINFO4 = 0x1c1;   // cnc_rdgrpinfo4 — args: grp_no, direction, num_to_read
+const FN_RDTLINFO   = 0x1c4;   // cnc_rdtlinfo   — management limits
+
+// Wire sizes / offsets. The wire does NOT match the SDK's C layout: it widens every
+// field to a 4-byte long (IODBTGI4's `short grp_no` becomes a long, and its 2-byte pad
+// disappears — still 28 bytes a record). cnc_rdtlinfo additionally carries one leading
+// long before the four limits. Measured against a controller with the option on; see
+// docs/notes.md.
+const ODBTLINFO_BYTES = 20;    // leading long + max_group, max_tool, max_minute, max_cycle
+const ODBTLIFE2_BYTES = 8;     // long count + 4 trailing bytes
+const ODBUSEGR_BYTES  = 12;    // long next, use, slct (the "not used" shorts are dropped)
+const IODBTGI4_BYTES  = 28;    // 7 * long: grp_no, n_tool, life, counter, type, opt, rest
+
+// How many groups to ask for in one cnc_rdgrpinfo4 call. The controller has an
+// undocumented ceiling on num_to_read — on the 31i measured 2026-09-28 the request is
+// answered normally up to 103 and rejected with EW_PROTOCOL on frame type 0x2103 from
+// 104 up (the vendor DLL sidesteps it by clamping to 51). Read groups in pages instead
+// of guessing a controller's capacity; see readgrpinfo4() and docs/notes.md.
+const TOOL_GROUP_PAGE = 64;
+
 // ── Low-level framing ─────────────────────────────────────────────────────────
 function encap(ftype, payload, fvers = 1) {
     if (ftype === FTYPE_VAR_REQU) {
@@ -189,9 +216,16 @@ function hexDump(buf, n = 16) {
 // shapes have to name the function and the CNC's reason: an EW_* status is a real
 // answer from the controller and must never be mistaken for "no data".
 function reqErr(fnName, st, detail) {
-    return st.error !== undefined
-        ? `${fnName}: CNC returned ${focasErrName(st.error)} (${st.error})${detail ? ` ${detail}` : ''}`
-        : `${fnName}: malformed or empty response frame`;
+    const suffix = detail ? ` ${detail}` : '';
+    if (st.error !== undefined)
+        return `${fnName}: CNC returned ${focasErrName(st.error)} (${st.error})${suffix}`;
+    // A reply in an unexpected frame type (e.g. 0x2103, which the controller uses to
+    // reject an out-of-range request) is not a malformed frame — say which one it was
+    // and keep the head, instead of reporting every non-answer the same way.
+    if (st.ftype !== undefined)
+        return `${fnName}: unexpected reply frame 0x${st.ftype.toString(16).padStart(4, '0')}` +
+               `${st.raw ? ` (head=${hexDump(st.raw)})` : ''}${suffix}`;
+    return `${fnName}: malformed or empty response frame${suffix}`;
 }
 
 // ── Main client class ─────────────────────────────────────────────────────────
@@ -353,8 +387,11 @@ class Focas {
         await this._send(encap(FTYPE_VAR_REQU, Buffer.concat([cmd, args, pl])));
         const raw = await this._recv();
         const t   = decap(raw);
-        if (t.len === 0) return { len: -1 };
-        if (t.ftype !== FTYPE_VAR_RESP) return { len: -1 };
+        // Carry the frame type and the head into the failure so reqErr can name a reply
+        // the controller sent in a frame type we do not handle (0x2103 on an over-range
+        // request), rather than calling it malformed.
+        if (t.len === 0)                return { len: -1, ftype: t.ftype, raw: t.data };
+        if (t.ftype !== FTYPE_VAR_RESP) return { len: -1, ftype: t.ftype, raw: t.data };
         const d = t.data[0];
         if (d.slice(0, 6).equals(cmd) && d[6] === 0 && d[7] === 0 && d[8] === 0 && d[9] === 0 && d[10] === 0 && d[11] === 0) {
             return { len: d.readUInt16BE(12), data: d.slice(14) };
@@ -651,6 +688,86 @@ class Focas {
         const values = await this.readspmeter();
         return values.length ? values[0] : null;
     }
+
+    // ── Tool life ─────────────────────────────────────────────────────────────
+    // Tool-life management is a separate CNC option. When it is off the controller
+    // answers every call below with EW_NOOPT (6) — and answers it rather than
+    // returning zeroes — so these throw instead of degrading to an empty table,
+    // which is what makes "no option" distinguishable from "no tools registered".
+
+    // cnc_rdtlinfo — management limits, used to size the group read and to compute
+    // usage percentages. The block opens with one long that is not part of ODBTLINFO,
+    // so the four limits start at +4 (checked against a run where the grouping of
+    // 30/128/8/60000 only lines up this way).
+    async readtlinfo() {
+        const st = await this._reqSingle(1, 1, FN_RDTLINFO);
+        if (st.error !== undefined || st.len < ODBTLINFO_BYTES)
+            throw new Error(reqErr('cnc_rdtlinfo', st));
+        const d = st.data;
+        return {
+            max_group:  d.readInt32BE(4),
+            max_tool:   d.readInt32BE(8),
+            max_minute: d.readInt32BE(12),
+            max_cycle:  d.readInt32BE(16),
+        };
+    }
+
+    // cnc_rdngrp — how many tool groups have at least one tool registered. The count is
+    // the first long; reading at +4 (the C struct's `dummy[2]` offset) returns the max
+    // group count instead.
+    async readngrp() {
+        const st = await this._reqSingle(1, 1, FN_RDNGRP);
+        if (st.error !== undefined || st.len < ODBTLIFE2_BYTES)
+            throw new Error(reqErr('cnc_rdngrp', st));
+        return st.data.readInt32BE(0);
+    }
+
+    // cnc_rdusegrpid — the group currently in use, the next one, and the selected one.
+    // The wire is just three longs: ODBUSEGR's leading `datano`/`type` are documented
+    // "not used" and are not sent, so next/use/slct start at +0 (+4/+8/+12 would run off
+    // the end of the 12-byte payload).
+    async readusegrpid() {
+        const st = await this._reqSingle(1, 1, FN_RDUSEGRPID);
+        if (st.error !== undefined || st.len < ODBUSEGR_BYTES)
+            throw new Error(reqErr('cnc_rdusegrpid', st));
+        const d = st.data;
+        return {
+            next: d.readInt32BE(0),
+            use:  d.readInt32BE(4),
+            slct: d.readInt32BE(8),
+        };
+    }
+
+    // cnc_rdgrpinfo4 — one IODBTGI4 record per group, ascending from grpNo. The
+    // struct is fixed-length (no trailing var array), so reading a whole block in
+    // one call is safe. Keep numToRead at or below TOOL_GROUP_PAGE: the controller
+    // rejects a large read outright (see that constant), so callers that want every
+    // group should page through with grpNo rather than ask for a big number once.
+    async readgrpinfo4(grpNo = 1, numToRead = TOOL_GROUP_PAGE) {
+        const st = await this._reqSingle(1, 1, FN_RDGRPINFO4, grpNo, 0, numToRead);
+        if (st.error !== undefined || st.len <= 0)
+            throw new Error(reqErr('cnc_rdgrpinfo4', st));
+        if (st.len % IODBTGI4_BYTES !== 0)
+            throw new Error(
+                `cnc_rdgrpinfo4: ${st.len} bytes is not a whole number of ` +
+                `${IODBTGI4_BYTES}-byte group records`
+            );
+        const groups = [];
+        for (let p = 0; p + IODBTGI4_BYTES <= st.data.length; p += IODBTGI4_BYTES) {
+            groups.push({
+                // grp_no is a 4-byte long on the wire, not the C struct's short: reading
+                // 16 bits there returns the top half of the number (0 for groups 1..255).
+                grp_no:      st.data.readInt32BE(p),
+                n_tool:      st.data.readInt32BE(p + 4),
+                count_value: st.data.readInt32BE(p + 8),
+                counter:     st.data.readInt32BE(p + 12),
+                count_type:  st.data.readInt32BE(p + 16),
+                opt_grpno:   st.data.readInt32BE(p + 20),
+                life_rest:   st.data.readInt32BE(p + 24),
+            });
+        }
+        return groups;
+    }
 }
 
-module.exports = { Focas, ALLAXIS };
+module.exports = { Focas, ALLAXIS, TOOL_GROUP_PAGE };

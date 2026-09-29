@@ -53,6 +53,12 @@ const CASES = [
     ['cnc_rdaxisnum   (servo axcount)',   0xa4, [2]],
     ['cnc_rdparam3     (readparam3)',     0x8d, [6711, 6711, -1]],
     ['cnc_rdparam      (readparam3 fall)',0x0e, [6711, 6711, -1]],
+    // Tool life. All four need the CNC's "tool life management" option; without it
+    // the controller answers EW_NOOPT (6) — the request itself is still correct.
+    ['cnc_rdusegrpid  (tool life group)', 0x48,  []],
+    ['cnc_rdngrp      (tool life count)', 0x4a,  []],
+    ['cnc_rdgrpinfo4  (tool life groups)',0x1c1, [1, 0, 10]],
+    ['cnc_rdtlinfo    (tool life limits)',0x1c4, []],
 ];
 
 (async () => {
