@@ -351,11 +351,12 @@ async function fnAxesData(focas, axisType) {
     }
 }
 
-// Every axes reading All Data carries, in one block. Feedrate and spindle speed are left
-// out: they already have their own fields under feedrate_spindle.
+// Every axes reading All Data carries, in one block, in this order — the servo readings
+// sit together, and feedrate / spindle speed are left out because they already have their
+// own fields under feedrate_spindle.
 const AXES_SUBTYPES_ALL = [
     'abs_pos', 'machine_pos', 'rel_pos', 'dist_to_go',
-    'servo_load', 'spindle_load', 'servo_current',
+    'servo_load', 'servo_current', 'spindle_load',
 ];
 
 async function fnAxesDataAll(focas) {
