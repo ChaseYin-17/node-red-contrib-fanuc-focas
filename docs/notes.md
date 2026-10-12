@@ -233,3 +233,85 @@ the decode path is simply not exercised there.
 socket and drives the real node code, covering the wire offsets, the per-group model, the
 paging loop's four stop conditions and the three `reqErr` failure shapes. Run it on any
 change to the decoders or the page loop.
+
+---
+
+## Alarm status and PMC alarms: opcodes
+
+Captured 2026-10-12 with `tools/probe-dll-opcode.py` on two controllers, which agreed
+byte-for-byte on every request below:
+
+| | machine |
+|---|---|
+| 1 | the 31i at `10.192.233.95:8193` — cnc_type `31`, maxaxis 32, 5 axes (`X1 Z1 C1 Y1 T1`) |
+| 2 | the 31i at `192.168.100.128:8193` — cnc_type `31`, series `G11Z`, maxaxis 32, 3 axes (`X Y Z`) |
+
+`cnc_rdsvmeter` ran first on both as the control and its `0x56` was present, so the
+captures are sound. A sound capture is not the same as a sound transcription, though: one
+row of the table was written down with its command pair reversed. See the `pmc_rdalmmsg`
+note below.
+
+| call | wire func | c1/c2 | request args |
+|---|---|---|---|
+| `cnc_alarm`   | `0x1a`   | 1 / 1 | — |
+| `cnc_alarm2`  | `0x1a`   | 1 / 1 | — (byte-identical frame to `cnc_alarm`) |
+| `pmc_rdalmmsg`| `0x8010` | 2 / 1 | `s_number`, `read_num` |
+
+**`pmc_rdalmmsg` is 2 / 1, and this table said 1 / 2 until 2026-10-12.** The two words of
+that request were read off the hexdump in the wrong order, and the transposition went into
+`focas.js` as `PMC_RDALMMSG_C2 = 2` with `c1` left at 1. It is not a benign difference and it
+is not an "unknown function" answer either: the controller takes the second word of the pair
+as a path/unit selector, so the transposed request is answered **`EW_PATH` (11)** — a *path*
+error for a function that has no path argument — on every poll, while the correct one is
+answered normally.
+
+What closed it was putting both requests on the same controller and diffing them, the 31i at
+`192.168.100.128` (2026-10-12): the vendor library's `pmc_rdalmmsg` came off the proxy as
+`... 00 02 00 01 80 10 | 00 00 00 01 00 00 00 0a ...` and this project's as
+`... 00 01 00 02 80 10 | 00 00 00 01 00 00 00 0a ...` — the arguments and the opcode byte for
+byte identical, only the command pair swapped. With the pair corrected, `readpmcalarm()` on
+that machine answers `{read_num: 0, exist: -1}` (EW_OK, no PMC alarm pending), matching the
+library's own result. All other requests in the table are 1 / 1 and were unaffected.
+
+`tools/probe-dll-opcode.py --stub` now prints every request as `c1=2 c2=1 func=0x8010
+args=1 10 0 0 0` rather than as hex, which is the form that would have caught this on the
+day. It runs against a stub controller (no machine needed) and reuses the open-response body
+recorded below.
+
+**The open handshake is not as thin as this project's client assumes.** `cnc_allclibhndl3`
+sends `a0 a0 a0 a0 | 0001 | 0101 | 0002 | 0001` and a controller answers with a **360-byte**
+structure of capability and version words (`ftype 0x0102`, and `0003` where the request had
+`0001` in the word at offset 4). `focas.js` reads the frame type and discards the body, which
+is fine for a client, but the vendor library parses it: replay a short body and
+`cnc_allclibhndl3` returns `EW_PROTOCOL` (-17) without sending a single call. That body is
+what makes `--stub` work, which is why it is kept verbatim in the tool. The word at offset 4
+is 1 in every request the library makes and 3 in every reply this machine gives.
+
+**`cnc_alarm2` is not a second opcode.** The library puts a byte-for-byte identical
+request on the wire for both APIs; the only difference is the width the caller asked for
+(`ODBALM.data` is a `short`, `cnc_alarm2` writes a `long`). `focas.js` sends `0x1a` for
+both and masks — 16 bits for `readalarmstatus()`, 32 for `readalarmstatus2()`. The mask
+matters: on a word carrying only an upper-half alarm, `cnc_alarm` reports nothing at all,
+which is why the 30i family needs the second call.
+
+**`0x22` is not `cnc_alarm`.** `tools/probe-funcsupport.js` and `tools/probe-alarms.js`
+labelled it that way and the label was never verified — nothing in this project had put
+`0x22` on the wire as an alarm read. It was corrected to `0x1a` in both. `0x22` belongs to
+some other function; which one is unknown.
+
+**Response layouts.** `cnc_alarm` answers with a 4-byte data block — `ODBALM`'s
+`short dummy[2]` is dropped and `data` widened to a long, the same treatment `ODBALMMSG`
+gets. The 4 bytes are confirmed on both controllers; the second one answered `0x0001`
+(bit #00, *Parameter switch on*, on the 30i bit table), so the decode is exercised on a
+non-zero word rather than only on zeroes. `pmc_rdalmmsg` answers with an 8-byte header,
+two longs: `read_num` (records that follow) then `exist` (`-1` none, `0` all read, `1`
+more — `PMC_ALARM_NO`/`_ALL_READ`/`_STILL`).
+
+The PMC record **width is still unmeasured.** Every controller this has run against had no
+PMC alarm pending (`read_num=0`, `exist=-1`) — the two captured above and, after the c1/c2
+fix, `192.168.100.128` again, where `readpmcalarm()` now answers the same `{read_num: 0,
+exist: -1}` the library does. Nothing has been seen after the 8-byte header, so
+`readpmcalarm()` slices records out of `(payload − 8) / read_num` rather than assuming
+`ODBPMCALM`'s 128 bytes. Re-run the capture on a controller with a PMC alarm up to close
+that.
+

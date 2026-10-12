@@ -67,7 +67,7 @@ npm install node-red-contrib-fanuc-focas
 
 | Function | Description | `msg.payload` fields |
 |----------|-------------|----------------------|
-| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `axes_data`, `tool_life`, `active_alarms`, `errors` |
+| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `axes_data`, `tool_life`, `active_alarms`, `alarm_status`, `pmc_alarms`, `errors` |
 | **Status Info** | Machine run state | `mode`, `run_state`, `motion`, `mstb`, `emergency`, `alarm`, `edit` |
 | **System Info** | Controller identity | `cnc_type`, `mt_type`, `series`, `version`, `axes` |
 | **Timers** | Accumulated time counters | `power_on_time`, `auto_operation_time`, `cutting_time`, `cycle_time` |
@@ -77,6 +77,8 @@ npm install node-red-contrib-fanuc-focas
 | **Part Count** | Parts produced | `required_parts`, `lifetime_total` |
 | **Tool Life** | Per-group tool life | `group_count`, `using_group`, `groups[]`, `most_used_group`, … |
 | **Alarm Messages** | Active alarms | Array of `{ type, type_code, code, axis, text }` |
+| **Alarm Status** | Alarm status word | `status`, `bits[]` of `{ bit, label }` |
+| **PMC Alarms** | PMC's own ERxx/WNxx messages | Array of `{ message }` |
 | **Macro** | Custom macro variables | `{ [macro_number]: value, … }` |
 
 ### Axes Data sub-types
@@ -193,6 +195,47 @@ When **Function** is `Alarm Messages` the payload is an **array**, with the poll
 attached as a property (not visible when the array is JSON-serialised). Other functions return
 an object containing `timestamp`.
 
+### Alarm status
+
+The status word is a **different read from the messages**, and the two do not have to agree.
+`cnc_alarm2` returns a 32-bit bitmask; bit *N* is the condition `cnc_rdalmmsg` would report as
+category *N*, so the labels come from the same per-series table. A bit can be set with no
+message to match it — a status bit is a condition, not always something the controller turns
+into text.
+
+```json
+{
+  "status": 130,
+  "bits": [
+    { "bit": 1, "label": "Foreground P/S (PS)" },
+    { "bit": 7, "label": "PMC error (PC)" }
+  ]
+}
+```
+
+`status` is the raw word and every set bit appears in `bits` with its number and label, so a
+label can be re-derived if the controller is not recognised. The 16-bit `cnc_alarm` is not
+used: over Ethernet the SDK marks it unsupported on 16i/18i/21i, and it cannot carry the upper
+bits the 30i family needs. On the wire `cnc_alarm` and `cnc_alarm2` are the same call.
+
+### PMC alarms
+
+The PMC's **own** ERxx/WNxx messages — ROM parity, I/O allocation errors, ladder size errors.
+This is the PMC itself failing, **not** the ladder's external (EX) messages: those arrive as
+CNC alarms and appear under `Alarm Messages` instead. The text is served by the FOCAS library's
+`fwpmcalm.ini`, so message bodies live on the PC, not on the machine.
+
+```json
+[
+  { "message": "ER30 Battery Alarm" }
+]
+```
+
+This is its own field for that reason — merging it into `active_alarms` would mix a PMC fault
+with the alarms the ladder is reporting. The call reports whether more alarms are waiting, so
+the node pages rather than truncating (capped, so a controller that always says "more" cannot
+run the loop away).
+
 ### Tool life
 
 **Tool Life** reads the CNC's tool-life management: one entry per registered tool group,
@@ -282,6 +325,10 @@ The rules:
 - `errors` is `{}` when every field read cleanly.
 - `active_alarms` is **`null` when the alarm read failed** and **`[]` when the controller
   answered but has no active alarms** — the two are deliberately distinguishable.
+- The three alarm fields are **three independent reads** (`cnc_rdalmmsg`, `cnc_alarm2`,
+  `pmc_rdalmmsg`), so one can fail, or be empty, while the others are fine — a PMC fault does
+  not blank the NC messages and vice versa. `null` means that read failed; `[]` (or
+  `bits: []`) means it answered and found nothing.
 - Only the other **Functions** (single-value polls) raise. If you want a failure to be visible
   as a node error rather than a degraded payload, poll `Alarm Messages` on its own.
 
@@ -356,6 +403,8 @@ The rules:
     "most_used_group": 1
   },
   "active_alarms": [],
+  "alarm_status": { "status": 0, "bits": [] },
+  "pmc_alarms": [],
   "errors": {},
   "timestamp": "2026-05-28T07:35:23.213Z"
 }
@@ -373,6 +422,11 @@ With an alarm present, `active_alarms` fills in:
       "text": "PARAMETER ENABLE SWITCH ON"
     }
   ],
+  "alarm_status": {
+    "status": 1,
+    "bits": [ { "bit": 0, "label": "Parameter switch on (SW)" } ]
+  },
+  "pmc_alarms": [],
   "errors": {},
   "timestamp": "2026-05-28T07:35:23.213Z"
 }
@@ -435,7 +489,7 @@ No additional npm dependencies — uses only Node.js built-ins (`net`, `Buffer`)
 - **The controller accepts only a few concurrent sessions** — 5 on the machine this was measured against. Each poll takes one, so polls that overlap are refused, and the node serialises them per node rather than letting a burst collide. A message that arrives while a poll is running waits its turn; nothing is dropped and no second session is opened. Running several nodes on one inject is fine for the same reason, but they queue behind each other.
 - **A refused session says so.** When every slot is in use the controller answers with frame type `0x0103` instead of the usual open response, and the node reports it as `Open refused by controller — every FOCAS session is in use`, with the raw bytes, rather than the generic "Open handshake failed" that made this look like a network fault.
 - The FOCAS wire protocol is reverse-engineered from [`diohpix/pyfanuc`](https://github.com/diohpix/pyfanuc) with several bug fixes applied (valtype-2 unpack, readparam3 fallback guard, statinfo cnctype matching).
-- Wire behaviour is cross-checked against the FANUC FOCAS2 SDK (`lib/FOCAS2 Library/`) — per-function specs in `Document/SpecE/Misc/`, status codes in `Document/SpecE/ERRCODE.HTM`.
+- Wire behaviour is cross-checked against the FANUC FOCAS2 SDK (`docs/FANUC_Focas_API/`) — per-function specs in `Document/SpecE/Misc/`, status codes in `Document/SpecE/ERRCODE.HTM`.
 - The load-meter function codes and their record layout were read off the official library's own traffic: the 64-bit SDK is driven over a local TCP proxy and the frames the vendor DLL puts on the wire are decoded (`tools/probe-funcsupport.js` prints the whole opcode support map for a controller). Guessing an opcode is what made the load meters silently report `null` — see `tools/verify-node-load.js`.
 - Opcodes are **per-series**, not universal: `cnc_diagnoss` (0x30) answers `EW_FUNC` on a controller that does not implement it, and `cnc_rdparam3` uses a different code on 16i than on 30i/0i-D. Where a function is optional, the node reports the `EW_*` status instead of degrading to `null`.
 - The tool-life function codes were read off the vendor library the same way — `0x48` `cnc_rdusegrpid`, `0x4a` `cnc_rdngrp`, `0x1c1` `cnc_rdgrpinfo4`, `0x1c4` `cnc_rdtlinfo`. The wire offsets were then pinned against a controller with the option on (see [`docs/notes.md`](docs/notes.md)). `tools/verify-node-toollife-offline.js` guards the decode, the record model and the paging loop with **no hardware** (35 checks); `tools/verify-node-toollife.js` checks it end to end against a real controller.

@@ -64,7 +64,7 @@
     // Functions that need no extra config
     const FANUC_SIMPLE_FNS = new Set([
         'status_info','system_info','timers','program_number',
-        'part_count','tool_life','alarm_messages','all'
+        'part_count','tool_life','alarm_messages','alarm_status','pmc_alarms','all'
     ]);
 
     RED.nodes.registerType('fanuc-focas', {
@@ -94,6 +94,8 @@
                 part_count:     'Part Count',
                 tool_life:      'Tool Life',
                 alarm_messages: 'Alarm Messages',
+                alarm_status:   'Alarm Status',
+                pmc_alarms:     'PMC Alarms',
                 macro:          'Macro',
             }[this.fn] || this.fn;
             return this.name || (host ? `${host} · ${fnLabel}` : fnLabel);
@@ -165,6 +167,8 @@
             <option value="part_count">Part Count</option>
             <option value="tool_life">Tool Life</option>
             <option value="alarm_messages">Alarm Messages</option>
+            <option value="alarm_status">Alarm Status</option>
+            <option value="pmc_alarms">PMC Alarms</option>
             <option value="macro">Macro</option>
             </optgroup>
         </select>
@@ -212,6 +216,13 @@
             <em>tool life management</em> option — without it the node reports the
             controller's <code>EW_NOOPT</code>.</dd>
         <dt>Alarm Messages</dt><dd>Active alarms with type, code, axis, text</dd>
+        <dt>Alarm Status</dt><dd>The alarm <em>status word</em> (<code>status</code>) plus the
+            set bits decoded (<code>bits</code>: bit number and its per-series label). Cheaper
+            than the messages and can be set with nothing in <em>Alarm Messages</em> to match
+            it — a status bit is a condition, not always a message.</dd>
+        <dt>PMC Alarms</dt><dd>The PMC's own ERxx/WNxx messages (ROM parity, I/O allocation
+            errors, ladder size errors). Not the ladder's external (EX) messages — those
+            arrive as CNC alarms and appear under <em>Alarm Messages</em>.</dd>
         <dt>Macro</dt><dd>Custom macro variable values by number</dd>
     </dl>
 
