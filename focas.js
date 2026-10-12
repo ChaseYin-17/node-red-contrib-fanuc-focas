@@ -4,7 +4,7 @@
  * Port of diohpix/pyfanuc with all known bug-fixes applied.
  *
  * Protocol constants match pyfanuc.py exactly.
- * Wire behaviour is verified against the FANUC FOCAS2 SDK shipped in lib/FOCAS2 Library
+ * Wire behaviour is verified against the FANUC FOCAS2 SDK shipped in docs/FANUC_Focas_API
  * (see Document/SpecE/Misc/*.xml for per-function specs, ERRCODE.HTM for status codes).
  * All methods return Promises.
  */
@@ -83,6 +83,45 @@ const IODBTGI4_BYTES  = 28;    // 7 * long: grp_no, n_tool, life, counter, type,
 // 104 up (the vendor DLL sidesteps it by clamping to 51). Read groups in pages instead
 // of guessing a controller's capacity; see readgrpinfo4() and docs/notes.md.
 const TOOL_GROUP_PAGE = 64;
+
+// ── Alarm / PMC alarm function codes ──────────────────────────────────────────
+// Captured with tools/probe-dll-opcode.py — the vendor library driven through a
+// local proxy with both directions hexdumped, which is how cnc_rdsvmeter = 0x56
+// and cnc_rdspmeter = 0x40 were read off. Taken 2026-10-12 on two 31i controllers
+// (10.192.233.95:8193 and 192.168.100.128:8193), which agreed on every frame below;
+// cnc_rdsvmeter ran first on both as the control and its 0x56 was present, so both
+// captures are sound. See docs/notes.md for the full table.
+//
+//     cnc_alarm             0x1a    c1=1 c2=1, no arguments
+//     cnc_alarm2            0x1a    identical request, see below
+//     pmc_rdalmmsg          0x8010  c1=2 c2=1, args (s_number, read_num)
+//
+// cnc_alarm2 is NOT a second opcode: the library puts a byte-for-byte identical
+// request on the wire for both APIs and only the caller's struct width differs.
+// Both reads below therefore use 0x1a and differ in how much of the returned status
+// they keep — 16 bits for cnc_alarm (ODBALM.data is a short), 32 for cnc_alarm2.
+//
+// pmc_rdalmmsg is the one call here whose command pair is not 1/1, and it is 2/1 —
+// not 1/2. The two words of that request were read off the hexdump in the wrong
+// order, and the transposition was carried into this file as `PMC_RDALMMSG_C2 = 2`
+// with c1 left at 1. It is not a harmless difference: the controller takes the
+// second word of the pair as a path/unit selector, so (1,2) is answered EW_PATH (11)
+// — a *path* error for a function that has no path argument — while (2,1) is answered
+// normally. Found by putting both requests on the same controller and diffing them,
+// the 31i at 192.168.100.128 (2026-10-12); see docs/notes.md.
+//
+// NOTE 0x22 is not cnc_alarm. tools/probe-funcsupport.js and tools/probe-alarms.js
+// used to label it that way; the label was never verified and this capture shows it
+// is wrong. 0x22 belongs to some other function, and nothing here knows which.
+const FN_ALARM        = 0x1a;     // cnc_alarm / cnc_alarm2
+const FN_PMC_RDALMMSG = 0x8010;   // pmc_rdalmmsg
+const PMC_RDALMMSG_C1 = 2;        // ... which the controller only answers with c1=2,
+const PMC_RDALMMSG_C2 = 1;        //     c2=1 — see above, the pair is not 1/1.
+
+// pmc_rdalmmsg's `exist` out-parameter (FwSymbol.h: PMC_ALARM_NO / _ALL_READ / _STILL).
+// 0 — everything asked for was read — needs no name; it is the `more === false` path.
+const PMC_ALARM_NO     = -1;      // there is no alarm
+const PMC_ALARM_STILL  = 1;       // more alarms than were asked for
 
 // ── Low-level framing ─────────────────────────────────────────────────────────
 function encap(ftype, payload, fvers = 1) {
@@ -189,7 +228,7 @@ function parseParamBody(data, maxaxis) {
 }
 
 // ── FOCAS status codes ────────────────────────────────────────────────────────
-// FOCAS2 spec: lib/FOCAS2 Library/Document/SpecE/ERRCODE.HTM
+// FOCAS2 spec: docs/FANUC_Focas_API/Document/SpecE/ERRCODE.HTM
 const FOCAS_ERRORS = {
     '-17':'EW_PROTOCOL', '-16':'EW_SOCKET', '-15':'EW_NODLL', '-11':'EW_BUS',
     '-10':'EW_SYSTEM2',   '-9':'EW_HSSB',    '-8':'EW_HANDLE', '-7':'EW_VERSION',
@@ -555,6 +594,100 @@ class Focas {
             ret.push(entry);
         }
         return ret;
+    }
+
+    /**
+     * cnc_alarm (0x1a) — the CNC's alarm *status* word, as opposed to the alarm
+     * messages readalarmcode() returns. This is the cheap "is anything wrong"
+     * poll: one request, no text.
+     *
+     * The bit meanings are per-series and are the same table cnc_rdalmmsg's `type`
+     * indexes (SpecE/Misc/cnc_alarm.xml) — e.g. #07 is PMC error (PC) and #08 is
+     * external alarm message (EX) on Series 15i, while 30i puts EX at #15 and
+     * PMC error at #19. Nothing here labels them; the node layer owns the tables.
+     *
+     * The wire block is 4 bytes — ODBALM's `short dummy[2]` is dropped and `data` is
+     * widened to a long, the same treatment ODBALMMSG gets in readalarmcode. Only the
+     * low 16 bits are kept, because ODBALM.data is a short; use readalarmstatus2()
+     * when the upper half matters.
+     */
+    async readalarmstatus() {
+        return this._readalmstat('cnc_alarm', 0xffff);
+    }
+
+    /**
+     * cnc_alarm2 — the same status word, all 32 bits.
+     *
+     * This is the one to use on Series 15i, 30i, 0i-D/F and PMi-A: cnc_alarm's 16-bit
+     * struct cannot carry the upper alarm bits there (SpecE/Misc/cnc_alarm2.xml),
+     * which is the whole reason the second API exists. On the wire it is not a second
+     * function — the library sends the identical 0x1a request for both and the
+     * difference is only the width the caller asked for.
+     */
+    async readalarmstatus2() {
+        return this._readalmstat('cnc_alarm2', 0xffffffff);
+    }
+
+    async _readalmstat(fnName, mask) {
+        const st = await this._reqSingle(1, 1, FN_ALARM);
+        if (st.len < 0) throw new Error(reqErr(fnName, st));
+        if (st.len === 0) {
+            // As in readalarmcode: a clean success carrying no data omits `error`.
+            if (st.error !== undefined) throw new Error(reqErr(fnName, st));
+            return { status: 0, bits: [] };
+        }
+        // A 2-byte block is the C width, which the capture says this controller does
+        // not use — accept it anyway rather than misread a short as the low half.
+        const word = st.len >= 4
+            ? st.data.readUInt32BE(st.len - 4)
+            : st.data.readUInt16BE(0);
+        const status = (word & mask) >>> 0;
+        const bits = [];
+        for (let i = 0; i < 32; i++) if (status & (1 << i)) bits.push(i);
+        return { status, bits };
+    }
+
+    /**
+     * pmc_rdalmmsg (0x8010) — the PMC's *own* alarm messages: the ERxx/WNxx rows of
+     * the vendor library's fwpmcalm.ini (ROM parity, I/O allocation errors, ladder
+     * size errors, …). These are the PMC software/hardware failing, NOT the ladder's
+     * external (EX) messages — those arrive as alarms on the CNC and are read with
+     * readalarmcode(). The text is served by the library from that ini, so the
+     * message bodies live on the PC, not on the machine.
+     *
+     * `sNumber` is the 1-based alarm to start at and `readNum` how many to ask for.
+     * The reply opens with the two in/out parameters the C API hands back, as two
+     * longs: read_num (how many records follow) and `exist`. Records are sliced out
+     * of whatever is left, so their width never has to be assumed — but the width is
+     * also not confirmed, because the capture machine had no PMC alarm to read.
+     *
+     * Returns { alarms, read_num, exist, more }. Page by calling again with
+     * `sNumber + read_num` while `more` is true (FwSymbol.h: PMC_ALARM_STILL).
+     */
+    async readpmcalarm(sNumber = 1, readNum = 10) {
+        const st = await this._reqSingle(PMC_RDALMMSG_C1, PMC_RDALMMSG_C2,
+                                        FN_PMC_RDALMMSG, sNumber, readNum);
+        if (st.len < 0) throw new Error(reqErr('pmc_rdalmmsg', st));
+        if (st.len === 0) {
+            if (st.error !== undefined) throw new Error(reqErr('pmc_rdalmmsg', st));
+            return { alarms: [], read_num: 0, exist: PMC_ALARM_NO, more: false };
+        }
+        if (st.len < 8)
+            throw new Error(`pmc_rdalmmsg: ${st.len}-byte reply, expected at least the ` +
+                            '8-byte read_num/exist header');
+        const readNumGot = st.data.readInt32BE(0);
+        const exist      = st.data.readInt32BE(4);
+        const body       = st.data.slice(8);
+        const stride     = readNumGot > 0 ? Math.floor(body.length / readNumGot) : 0;
+
+        const alarms = [];
+        for (let i = 0; i < readNumGot && stride > 0; i++) {
+            let text = body.slice(i * stride, (i + 1) * stride);
+            const nullIdx = text.indexOf(0);
+            if (nullIdx !== -1) text = text.slice(0, nullIdx);
+            alarms.push({ message: text.toString('ascii').trim() });
+        }
+        return { alarms, read_num: readNumGot, exist, more: exist === PMC_ALARM_STILL };
     }
 
     // ── Axes position data ────────────────────────────────────────────────────

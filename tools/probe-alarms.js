@@ -196,9 +196,9 @@ async function probe(focas, label, c1, c2, c3, args) {
     console.log('  ', JSON.stringify(st));
     if (st) console.log(`   alarm field = ${st.alarm}  (raw) → ${['none', 'ALARM', 'BATTERY LOW', 'FAN', 'PS WARNING', 'FSSB WARNING', 'INSULATE', 'ENCODER', 'PMC ALARM'][st.alarm] ?? '?'}`);
 
-    h('BASELINE — getalarmstatus via func 0x22 (cnc_alarm)');
+    h('BASELINE — alarm status via func 0x1a (cnc_alarm / cnc_alarm2)');
     try {
-        const a = await f._reqSingle(1, 1, 0x22, 0);
+        const a = await f._reqSingle(1, 1, 0x1a, 0);
         console.log('  ', JSON.stringify(a));
     } catch (e) { console.log('  ✗', e.message); }
 

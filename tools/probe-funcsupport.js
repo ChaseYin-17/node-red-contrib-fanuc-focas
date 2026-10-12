@@ -39,7 +39,10 @@ const CASES = [
     ['cnc_sysinfo',                       0x18, []],
     ['cnc_statinfo',                      0x19, [0]],
     ['cnc_rdprgnum    (readprognum)',     0x1c, []],
-    ['cnc_alarm',                         0x22, [0]],
+    // 0x1a for both cnc_alarm and cnc_alarm2 — captured from the vendor library,
+    // which sends a byte-identical request for the two (see focas.js). 0x22 used to
+    // be listed here as cnc_alarm; that label was never verified and is wrong.
+    ['cnc_alarm',                         0x1a, [0]],
     ['cnc_rdalmmsg    (alarm_messages)',  0x23, [-1, 1, 1, 32]],
     ['cnc_rdactfeed   (readactfeed)',     0x24, []],
     ['cnc_rdactspdspeed(readspindlespeed)',0x25, []],

@@ -84,6 +84,8 @@ function stubPeripherals() {
     Focas.prototype.readprognum         = async () => ({ run: 100, main: 100 });
     Focas.prototype.listprog            = async () => ({ 100: { comment: 'TEST' } });
     Focas.prototype.readalarmcode       = async () => [];
+    Focas.prototype.readalarmstatus2    = async () => ({ status: 0, bits: [] });
+    Focas.prototype.readpmcalarm        = async () => ({ alarms: [], read_num: 0, exist: -1, more: false });
     Focas.prototype.readactfeed         = async () => 0;
     Focas.prototype.readactspindlespeed = async () => 0;
     Focas.prototype.readaxes            = async () => ({ ABS: [0, 0, 0] });

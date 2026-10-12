@@ -19,6 +19,17 @@ try {
             `focas.js and fanuc-focas.js are out of sync — update them together.`
         );
     }
+    // The alarm_status / pmc_alarms fields call these. Without the check the failure is
+    // "readalarmstatus2 is not a function" at poll time, once per poll, instead of a
+    // load-time error naming the file that needs updating.
+    for (const method of ['readalarmstatus2', 'readpmcalarm']) {
+        if (typeof Focas.prototype[method] !== 'function') {
+            throw new Error(
+                `focas.js has no Focas.prototype.${method}. ` +
+                `focas.js and fanuc-focas.js are out of sync — update them together.`
+            );
+        }
+    }
 } catch (e) {
     throw new Error(`node-red-contrib-fanuc-focas: failed to load focas.js — ${e.message}`);
 }
@@ -41,9 +52,11 @@ const ALM_STATES = {
     4:'PS WARNING', 5:'FSSB WARNING', 6:'INSULATE WARNING',
     7:'ENCODER WARNING', 8:'PMC ALARM',
 };
-// cnc_rdalmmsg alarm categories. `type` is an index into a per-series enum, NOT the
-// bitmask used by cnc_alarm — the same index means different things on different series.
-// FOCAS2 spec: lib/FOCAS2 Library/Document/SpecE/Misc/cnc_rdalmmsg.xml
+// cnc_rdalmmsg alarm categories. `type` is an index into a per-series enum, NOT a
+// universal code — the same number means different things on different series. The same
+// per-series numbering indexes cnc_alarm/cnc_alarm2's status bitmask, which is why one
+// table serves both (see fnAlarmStatus).
+// FOCAS2 spec: docs/FANUC_Focas_API/Document/SpecE/Misc/cnc_rdalmmsg.xml
 const ALM_TYPES_15I = {
     0:'Background P/S (BG)', 1:'Foreground P/S (PS)', 2:'Overheat alarm (OH)',
     3:'Sub-CPU error (SB)', 4:'Syncronized error (SN)', 5:'Parameter switch on (SW)',
@@ -91,6 +104,12 @@ function almSeriesGroup(focas, cncSeries) {
 }
 const ALM_TYPES_BY_GROUP = { '15i': ALM_TYPES_15I, '16i': ALM_TYPES_16I, '30i': ALM_TYPES_30I };
 const ALARM_MAX_MSGS = 10;   // messages read per poll
+
+// pmc_rdalmmsg paging. Unlike cnc_rdalmmsg this call reports whether alarms are still
+// waiting, so it pages instead of truncating — capped, because a controller that keeps
+// answering "more" must not be able to run the loop away.
+const PMC_ALARM_PAGE      = 10;   // messages asked for per call
+const PMC_ALARM_MAX_PAGES = 5;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function readParamVal(paramMap, key) {
@@ -303,6 +322,49 @@ async function fnAlarmMessages(focas, cncSeries) {
     }));
 }
 
+// ── Alarm status word (cnc_alarm2) ────────────────────────────────────────────
+// The same alarm *categories* cnc_rdalmmsg lists, but as a bitmask instead of a list:
+// bit N of the status word is the condition that cnc_rdalmmsg reports as `type` N.
+// The per-series tables line up exactly (15i bit #07 is PMC error and #08 external
+// alarm message; 30i puts EX at #15 and PMC error at #19), so the table above is
+// reused rather than written out twice. SpecE/Misc/cnc_alarm.xml vs cnc_rdalmmsg.xml.
+//
+// Read through cnc_alarm2, not cnc_alarm. This node is FOCAS2/Ethernet only, and the
+// SDK's support matrix marks the 16-bit cnc_alarm unsupported ("X") over Ethernet on
+// 16i/18i/21i; it also cannot carry the upper bits the 30i family uses. It costs
+// nothing to prefer the wider call — captured traffic shows the library sending a
+// byte-identical request for both and only the struct width differing (docs/notes.md).
+//
+// The word can be set with nothing in active_alarms to match it: a status bit is a
+// condition, not necessarily one the controller turns into a message.
+async function fnAlarmStatus(focas, cncSeries) {
+    const types = ALM_TYPES_BY_GROUP[almSeriesGroup(focas, cncSeries)];
+    const st    = await focas.readalarmstatus2();
+    return {
+        status: st.status,
+        bits:   st.bits.map(bit => ({ bit, label: types[bit] ?? String(bit) })),
+    };
+}
+
+// ── PMC alarms (pmc_rdalmmsg) ─────────────────────────────────────────────────
+// The PMC's own ERxx/WNxx messages — ROM parity, I/O allocation errors, ladder size
+// errors. These are the PMC failing, NOT the ladder's external (EX) messages: those
+// arrive as CNC alarms and live in active_alarms, which is why this is its own field
+// rather than being merged in.
+async function fnPmcAlarms(focas) {
+    const out = [];
+    let sNumber = 1;                    // s_number is 1-based
+    for (let page = 0; page < PMC_ALARM_MAX_PAGES; page++) {
+        const r = await focas.readpmcalarm(sNumber, PMC_ALARM_PAGE);
+        for (const a of r.alarms) out.push({ message: a.message });
+        // Stop unless there is genuinely more to ask for; a "more" with nothing read
+        // would advance sNumber by nothing and loop on the same page.
+        if (!r.more || r.read_num <= 0) break;
+        sNumber += r.read_num;
+    }
+    return out;
+}
+
 async function fnAxesData(focas, axisType) {
     // axisType maps to the what bitmask used in readaxes()
     // Implemented directly via _reqSingle for the data types we need
@@ -405,6 +467,8 @@ async function fnAll(focas, runModes, cncSeries) {
     const program = await read('active_program',     () => fnProgramNumber(focas));
     const parts   = await read('part_count',         () => fnPartCount(focas));
     const alarms  = await read('active_alarms',      () => fnAlarmMessages(focas, cncSeries));
+    const almstat = await read('alarm_status',       () => fnAlarmStatus(focas, cncSeries));
+    const pmcalm  = await read('pmc_alarms',         () => fnPmcAlarms(focas));
     const feed    = await read('actual_feedrate_mm_min', () => focas.readactfeed());
     const spindle = await read('actual_spindle_rpm',     () => focas.readactspindlespeed());
     const axes    = await read('axes_data',          () => fnAxesDataAll(focas));
@@ -420,6 +484,8 @@ async function fnAll(focas, runModes, cncSeries) {
         axes_data:        axes,
         tool_life:        tlife,
         active_alarms:    alarms,
+        alarm_status:     almstat,
+        pmc_alarms:       pmcalm,
         errors,
     };
 }
@@ -442,6 +508,8 @@ async function collect(ip, port, cnc_series, fn, subtype, params) {
             case 'part_count':     result = await fnPartCount(focas);              break;
             case 'tool_life':      result = await fnToolLife(focas);               break;
             case 'alarm_messages': result = await fnAlarmMessages(focas, cnc_series); break;
+            case 'alarm_status':   result = await fnAlarmStatus(focas, cnc_series);   break;
+            case 'pmc_alarms':     result = await fnPmcAlarms(focas);                 break;
             case 'axes_data':      result = await fnAxesData(focas, subtype);      break;
             case 'parameters':     result = await fnParameters(focas, params);     break;
             case 'macro':          result = await fnMacro(focas, params);          break;
