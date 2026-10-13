@@ -105,7 +105,7 @@ const h = (s) => console.log(`\n${'─'.repeat(72)}\n${s}\n${'─'.repeat(72)}`)
     }
     await tryIt(f, 'type=32  (out of range → EW_ATTRIB)', [32, 10, 1, 32], 32);
 
-    h('C. what the node sends today');
+    h('C. one category only (type=1) — narrower than what the node sends (type=-1)');
     await tryIt(f, 'type=1,  num=10, withtext=1, textlen=32', [1, 10, 1, 32], 32);
 
     await f.disconnect();

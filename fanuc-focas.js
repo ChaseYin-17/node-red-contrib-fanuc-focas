@@ -366,8 +366,8 @@ async function fnPmcAlarms(focas) {
 }
 
 async function fnAxesData(focas, axisType) {
-    // axisType maps to the what bitmask used in readaxes()
-    // Implemented directly via _reqSingle for the data types we need
+    // Each sub-type delegates to the matching reader in focas.js; the position ones
+    // are the `what` bitmask readaxes() takes.
     switch (axisType) {
         case 'feedrate':
             return { actual_feedrate_mm_min: await focas.readactfeed() };

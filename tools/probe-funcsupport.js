@@ -2,9 +2,10 @@
 /**
  * tools/probe-funcsupport.js — which FOCAS function codes does this CNC actually answer?
  *
- * readservoload()/readspindleload() swallow every failure into `null`, so the only way
- * to tell "unsupported function" from "empty result" from "layout mismatch" is to ask
- * the controller directly and read the EW_* status word.
+ * The node reports only the calls it already makes, and raises on a rejected one, so
+ * asking a controller directly is the only way to tell "unsupported function" from
+ * "empty result" from "layout mismatch" for a code the node does not send yet — and to
+ * see the whole per-controller support map in one pass, from the EW_* status word.
  *
  * Every code below is one this node already issues for a READ (or is a documented read
  * entry point), so nothing here can modify the controller.

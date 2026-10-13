@@ -609,12 +609,12 @@ def main():
                  g.count_type, g.opt_grpno, g.life_rest))
 
     # ── TARGET: alarm status and PMC alarm messages ───────────────────────────
-    # cnc_alarm = 0x22 is already on the wire in this project (probe-alarms.js and
-    # probe-funcsupport.js both issue it as cnc_alarm). cnc_alarm2 and pmc_rdalmmsg
-    # are separate exports whose function codes are nowhere in the SDK — not in
-    # Fwlib64.h, not in SpecE, not as an immediate in the dispatcher — so they come
-    # off the capture below, exactly like the load meters and the tool-life reads.
-    # All three only read, so this is safe on a live machine.
+    # cnc_alarm / cnc_alarm2 / pmc_rdalmmsg are exported calls whose function codes are
+    # nowhere in the SDK — not in Fwlib64.h, not in SpecE, not as an immediate in the
+    # dispatcher — so they come off the capture below, exactly like the load meters and
+    # the tool-life reads. This capture is what showed cnc_alarm and cnc_alarm2 to be the
+    # same 0x1a request, and pmc_rdalmmsg's command pair to be 2/1 rather than 1/1 (see
+    # docs/notes.md). All three only read, so this is safe on a live machine.
     h('TARGET — alarm status (cnc_alarm / cnc_alarm2)')
 
     alm = ODBALM()

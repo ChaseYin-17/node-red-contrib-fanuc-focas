@@ -28,9 +28,9 @@ const ALLAXIS   = -1;
 
 // ── Load-meter function codes ─────────────────────────────────────────────────
 // Taken from the official FOCAS2 library's own traffic (captured with a TCP proxy:
-// see tools/probe-diag.js for the raw opcode space). These are NOT diagnostics —
-// cnc_diagnoss (0x30) is a different, separately-licensed function that answers
-// EW_FUNC on controllers which do not implement it.
+// see tools/probe-dll-opcode.py). These are NOT diagnostics — cnc_diagnoss (0x30)
+// is a different, separately-licensed function that answers EW_FUNC on controllers
+// which do not implement it.
 const FN_SVMETER = 0x56;   // cnc_rdsvmeter — servo load meter
 const FN_SPMETER = 0x40;   // cnc_rdspmeter — spindle load meter / motor speed
 const FN_AXISNUM = 0xa4;   // axis or spindle count, selected by `type`
@@ -171,20 +171,6 @@ function decap(data) {
         return { len: len1, ftype, fvers, data: re };
     }
     return { len: len1, ftype, fvers, data: body };
-}
-
-// ── Build sub-command buffer (for _req_rdmulti) ───────────────────────────────
-function reqSub(c1, c2, c3, v1=0, v2=0, v3=0, v4=0, v5=0) {
-    const b = Buffer.alloc(6 + 5*4);
-    b.writeUInt16BE(c1, 0);
-    b.writeUInt16BE(c2, 2);
-    b.writeUInt16BE(c3, 4);
-    b.writeInt32BE(v1,  6);
-    b.writeInt32BE(v2, 10);
-    b.writeInt32BE(v3, 14);
-    b.writeInt32BE(v4, 18);
-    b.writeInt32BE(v5, 22);
-    return b;
 }
 
 // ── Decode 8-byte value (feedrate/spindle) ────────────────────────────────────
@@ -392,16 +378,6 @@ class Focas {
         });
     }
 
-    // async disconnect() {
-    //     if (!this.socket) return;
-    //     try {
-    //         await this._send(encap(FTYPE_CLS_REQU, Buffer.alloc(0)));
-    //         await this._recv();
-    //     } catch (_) {}
-    //     this.socket.destroy();
-    //     this.socket = null;
-    // }
-
     async disconnect() {
         if (!this.socket) return;
         const sock = this.socket;
@@ -485,10 +461,11 @@ class Focas {
         const is16 = ['16','31','18','0i','30',' 0','0 '].includes(t) ||
                      t === '0';   // 0i-D returns bare '0'
         if (is16 && st.len === 0x0e) {
+            // The wire drops ODBST's leading `hdck`/`tmmode` (18 bytes in the C struct,
+            // 14 here), so the 7 shorts that remain start at `aut` — which the C struct
+            // puts at +4, not +0.
             const d = st.data;
             return {
-                hdck:      d.readUInt16BE(0),
-                tmmode:    d.readUInt16BE(2),  // actually: aut at offset 0 per ODBST layout...
                 aut:       d.readUInt16BE(0),
                 run:       d.readUInt16BE(2),
                 motion:    d.readUInt16BE(4),
