@@ -98,9 +98,12 @@ function poll(msg) {
         console.log('  feedrate_spindle =', JSON.stringify(p.feedrate_spindle));
         console.log('  errors           =', JSON.stringify(p.errors));
         console.log('  active_alarms    =', p.active_alarms ? `${p.active_alarms.length} entry/entries` : String(p.active_alarms));
+        // active_alarms must still be an ARRAY (read cleanly, found nothing is []). It
+        // is not required to be non-empty: a controller with no alarm pending answers
+        // [] and that is a correct result, not a failure of this case.
         const ok = p.feedrate_spindle.actual_feedrate_mm_min === null
                 && typeof p.errors.actual_feedrate_mm_min === 'string'
-                && Array.isArray(p.active_alarms) && p.active_alarms.length > 0
+                && Array.isArray(p.active_alarms)
                 && p.machine_state !== null;
         console.log(ok ? '  ✔ degraded to null, everything else intact' : '  ✗ unexpected payload');
     } finally {
@@ -135,6 +138,10 @@ function poll(msg) {
     // machine carries that machine's series. Letting it win relabels every alarm while
     // type_code stays put, so the mistake is invisible. Stub cnc_type and check which
     // table the label comes from — the Series selector only offers 15 and 16.
+    //
+    // This needs an alarm to be present to compare labels. With none pending, the
+    // tables cannot be told apart from the payload, so the check is skipped rather
+    // than reported as a failure — the offline suite covers the table selection.
     const realSysinfo = Focas.prototype._getsysinfo;
     const withCnctype = (t) => {
         Focas.prototype._getsysinfo = async function () {
@@ -154,21 +161,34 @@ function poll(msg) {
         const i31on15 = type0(await labels('31', '15'));
         console.log(`  cnc_type=31, cnc_series=16 → ${JSON.stringify(i31on16)}`);
         console.log(`  cnc_type=31, cnc_series=15 → ${JSON.stringify(i31on15)}`);
-        if (!i31on16) console.log('  ⚠ no alarms on the controller — cannot tell the tables apart');
-        else if (i31on16 === i31on15) console.log('  ✔ a copied cnc_series no longer relabels the alarm');
-        else console.log('  ✗ cnc_series still overrides the controller\'s cnc_type');
+        if (!i31on16) {
+            console.log('  ⚠ no alarms on the controller — table selection not exercised here');
+            console.log('    (tools/verify-node-alarms-offline.js covers it with no hardware)');
+        } else if (i31on16 === i31on15) {
+            console.log('  ✔ a copied cnc_series no longer relabels the alarm');
+        } else {
+            console.log('  ✗ cnc_series still overrides the controller\'s cnc_type');
+        }
 
         const i15 = type0(await labels('15', '16'));
         console.log(`  cnc_type=15, cnc_series=16 → ${JSON.stringify(i15)}`);
-        console.log(i31on16 && i15 !== i31on16
-            ? '  ✔ cnc_type does drive the table (15i enum differs from 30i)'
-            : '  ✗ cnc_type appears to be ignored');
+        if (!i31on16 || !i15) {
+            console.log('  ⚠ cannot compare the 15i and 30i tables without an alarm');
+        } else if (i31on16 !== i15) {
+            console.log('  ✔ cnc_type does drive the table (15i enum differs from 30i)');
+        } else {
+            console.log('  ✗ cnc_type appears to be ignored');
+        }
 
         const fallback = type0(await labels('zz', '15'));
         console.log(`  cnc_type=zz (unusable), cnc_series=15 → ${JSON.stringify(fallback)}`);
-        console.log(i15 && fallback === i15
-            ? '  ✔ falls back to the configured series when cnc_type says nothing usable'
-            : '  ✗ fallback path broken');
+        if (!i15 || !fallback) {
+            console.log('  ⚠ cannot check the fallback path without an alarm');
+        } else if (fallback === i15) {
+            console.log('  ✔ falls back to the configured series when cnc_type says nothing usable');
+        } else {
+            console.log('  ✗ fallback path broken');
+        }
     } finally {
         Focas.prototype._getsysinfo = realSysinfo;
     }

@@ -77,6 +77,10 @@ const ODBTLIFE2_BYTES = 8;     // long count + 4 trailing bytes
 const ODBUSEGR_BYTES  = 12;    // long next, use, slct (the "not used" shorts are dropped)
 const IODBTGI4_BYTES  = 28;    // 7 * long: grp_no, n_tool, life, counter, type, opt, rest
 
+// cnc_rdprogdir's wire record: number(i32) | length(i32) | comment[64]. Measured
+// 2026-11-12 on the 31i at 10.192.233.166 — see listprog() and docs/notes.md.
+const PROGDIR_RECORD_BYTES = 72;
+
 // How many groups to ask for in one cnc_rdgrpinfo4 call. The controller has an
 // undocumented ceiling on num_to_read — on the 31i measured 2026-09-28 the request is
 // answered normally up to 103 and rejected with EW_PROTOCOL on frame type 0x2103 from
@@ -122,6 +126,11 @@ const PMC_RDALMMSG_C2 = 1;        //     c2=1 — see above, the pair is not 1/1
 // 0 — everything asked for was read — needs no name; it is the `more === false` path.
 const PMC_ALARM_NO     = -1;      // there is no alarm
 const PMC_ALARM_STILL  = 1;       // more alarms than were asked for
+
+// cnc_rdalmmsg's text field is 32 characters, full stop. The spec says so and points at
+// cnc_rdalmmsg2 for the 30i family; this call has no text-length argument in its C
+// signature. See readalarmcode() and docs/notes.md.
+const ALM_TEXT_MAX = 32;
 
 // ── Low-level framing ─────────────────────────────────────────────────────────
 function encap(ftype, payload, fvers = 1) {
@@ -174,6 +183,10 @@ function decap(data) {
 }
 
 // ── Decode 8-byte value (feedrate/spindle) ────────────────────────────────────
+// The wire record is value(i32) | format(i16) | dec(i16), so the decimal position is
+// the byte at +7 and the format selector the byte at +5. Measured 2026-11-12 on the
+// 31i at 10.192.233.166: cnc_actf answered `00 00 00 c8 00 0a 00 00` = 200 at dec 0
+// and cnc_acts `00 00 09 c4 00 0a 00 00` = 2500 at dec 0. See docs/notes.md.
 function decode8(val) {
     const flag = val[5];
     if (flag === 2 || flag === 10) {
@@ -185,28 +198,57 @@ function decode8(val) {
 }
 
 // ── Parse parameter response body (cnc_rdparam3) ─────────────────────────────
-// The `diag` variant of this decoder is gone: it was only ever reached by the
-// cnc_diagnoss load path and was never run against a real response. Diagnostics
-// have a different record layout, so a decoder for them has to be written against
-// captured traffic rather than borrowed from the parameter format.
+// The wire is NOT the IODBPSD C struct, and its attribute enum is not the one the
+// spec documents. Captured from the vendor library on the 31i at 10.192.233.166
+// (2026-11-12, tools/probe-dll-param.py + tools/probe-param-types.js):
+//
+//     datano(i32) | type(i16) | attr(i16) | record[MAX_AXIS] of 8 bytes
+//                                              value(i32) | dec(i32)
+//
+// `type` read 0xffff for every parameter on that controller, so it carries nothing;
+// the attribute is the word at +6. Its enum is measured, not documented:
+//
+//     attr 0  byte / word / 2-word   value = i32 at +0
+//     attr 1  bit                    value = the byte at +3
+//     attr 2  word with axis         value = i32 at +0
+//     attr 3  2-word with axis       value = i32 at +0
+//     attr 4  real                   value = i32 at +0, decimals = i32 at +4
+//
+// The old decoder read 4-byte records out of an 8-byte stride, took the attribute
+// from `type` (always 0xffff here) and had bit/byte swapped, so a bit parameter came
+// back as a byte and a real parameter came back as `undefined`.
+const PARAM_RECORD_BYTES = 8;
+const PARAM_ATTR_BIT      = 1;
+const PARAM_ATTR_REAL     = 4;
+
 function parseParamBody(data, maxaxis) {
-    const stride = maxaxis * 4 + 8;
+    const stride = maxaxis * PARAM_RECORD_BYTES + 8;
     const r = {};
     for (let pos = 0; pos + 8 <= data.length; pos += stride) {
-        const varname  = data.readUInt32BE(pos);
-        const axiscount = data.readInt16BE(pos + 4);
-        const valtype   = data.readUInt16BE(pos + 6);
-        const values    = { type: valtype, axis: axiscount, data: [] };
+        const varname = data.readUInt32BE(pos);
+        const attr    = data.readUInt16BE(pos + 6);
+        const values  = { type: attr, axis: -1, data: [] };
 
-        for (let n = pos + 8; n < pos + stride; n += 4) {
-            const chunk = data.slice(n, n + 4);
+        // Bound by the buffer as well as by the stride: a controller that answers a
+        // short block must not make this read past the end.
+        const end = Math.min(pos + stride, data.length);
+        for (let n = pos + 8; n + PARAM_RECORD_BYTES <= end; n += PARAM_RECORD_BYTES) {
+            const chunk = data.slice(n, n + PARAM_RECORD_BYTES);
             let value;
-            if      (valtype === 0) value = chunk[3];
-            else if (valtype === 1) { const b = chunk[3]; value = [7,6,5,4,3,2,1,0].map(i => (b>>i)&1); }
-            else if (valtype === 2) value = chunk.readInt16BE(2);   // fix: last 2 bytes
-            else if (valtype === 3) value = chunk.readInt32BE(0);
-            if (axiscount !== -1) { values.data.push(value); break; }
-            else                    values.data.push(value);
+            if (attr === PARAM_ATTR_BIT) {
+                // The bit parameter is one byte, and the wire puts it in the low byte
+                // of the record's first word: 1020 read `88 89 90 42 88` = X Y Z B X2.
+                value = chunk[3];
+            } else if (attr === PARAM_ATTR_REAL) {
+                // Real parameter = prm_val * 10 ** (-dec_val), the same identity the
+                // spec gives for REALPRM. 5001 read value 64 with dec 0.
+                const prm = chunk.readInt32BE(0);
+                const dec = chunk.readInt32BE(4);
+                value = prm / Math.pow(10, dec);
+            } else {
+                value = chunk.readInt32BE(0);
+            }
+            values.data.push(value);
         }
         r[varname] = values;
     }
@@ -225,8 +267,22 @@ const FOCAS_ERRORS = {
      '10':'EW_BUFFER',    '11':'EW_PATH',     '12':'EW_MODE',   '13':'EW_REJECT',
      '14':'EW_DTSRVR',    '15':'EW_ALARM',    '16':'EW_STOP',   '17':'EW_PASSWD',
 };
-function focasErrName(code) {
-    return FOCAS_ERRORS[String(code)] || 'EW_UNKNOWN';
+
+// The PMC Data Window has its OWN status table (ERRCODE.HTM, "PMC Data Window"), and
+// three of its codes mean something different from the CNC table above: 1 is EW_NOPMC
+// (not EW_FUNC), 3 is EW_RANGE (not EW_NUMBER) and 4 is EW_TYPE (not EW_ATTRIB). A PMC
+// call reported through the CNC table names the wrong fault.
+const PMC_ERRORS = {
+    '-17':'EW_PROTOCOL', '-16':'EW_SOCKET', '-15':'EW_NODLL', '-11':'EW_BUS',
+    '-10':'EW_SYSTEM2',   '-9':'EW_HSSB',    '-8':'EW_HANDLE', '-7':'EW_VERSION',
+     '-6':'EW_UNEXP',     '-5':'EW_SYSTEM',  '-4':'EW_PARITY', '-3':'EW_MMCSYS',
+     '-2':'EW_RESET',     '-1':'EW_BUSY',      '0':'EW_OK',      '1':'EW_NOPMC',
+      '2':'EW_LENGTH',     '3':'EW_RANGE',     '4':'EW_TYPE',    '5':'EW_DATA',
+      '6':'EW_NOOPT',     '10':'EW_BUFFER',   '17':'EW_PASSWD',
+};
+
+function focasErrName(code, table = FOCAS_ERRORS) {
+    return table[String(code)] || 'EW_UNKNOWN';
 }
 
 // The wire protocol gives no error text on a bad handshake, so the only way to tell
@@ -240,10 +296,10 @@ function hexDump(buf, n = 16) {
 // Turn a rejected `_reqSingle` result into the message it deserves. Both failure
 // shapes have to name the function and the CNC's reason: an EW_* status is a real
 // answer from the controller and must never be mistaken for "no data".
-function reqErr(fnName, st, detail) {
+function reqErr(fnName, st, detail, table = FOCAS_ERRORS) {
     const suffix = detail ? ` ${detail}` : '';
     if (st.error !== undefined)
-        return `${fnName}: CNC returned ${focasErrName(st.error)} (${st.error})${suffix}`;
+        return `${fnName}: CNC returned ${focasErrName(st.error, table)} (${st.error})${suffix}`;
     // A reply in an unexpected frame type (e.g. 0x2103, which the controller uses to
     // reject an out-of-range request) is not a malformed frame — say which one it was
     // and keep the head, instead of reporting every non-answer the same way.
@@ -458,12 +514,33 @@ class Focas {
     async statinfo() {
         const st = await this._reqSingle(1, 1, 0x19, 0);
         const t  = this.sysinfo.cnctype.trim();
+        // Series 15/15i has its own ODBST: `dummy[2]` then aut, manual, run, edit,
+        // motion, mstb, emergency, write, labelskip, alarm, warning, battery — 26 bytes
+        // in the C struct. It is a different shape from the 16/18/21/0i/30i block, so it
+        // is decoded separately rather than being forced through the same offsets.
+        if (t === '15') {
+            if (st.len < 0x0e) return null;
+            const d = st.data;
+            return {
+                aut:       d.readUInt16BE(0),
+                manual:    d.readUInt16BE(2),
+                run:       d.readUInt16BE(4),
+                edit:      d.readUInt16BE(6),
+                motion:    d.readUInt16BE(8),
+                mstb:      d.readUInt16BE(10),
+                emegency:  d.readUInt16BE(12),
+                alarm:     d.readUInt16BE(14),
+                warning:   d.readUInt16BE(16),
+                battery:   d.readUInt16BE(18),
+            };
+        }
         const is16 = ['16','31','18','0i','30',' 0','0 '].includes(t) ||
                      t === '0';   // 0i-D returns bare '0'
         if (is16 && st.len === 0x0e) {
             // The wire drops ODBST's leading `hdck`/`tmmode` (18 bytes in the C struct,
             // 14 here), so the 7 shorts that remain start at `aut` — which the C struct
-            // puts at +4, not +0.
+            // puts at +4, not +0. Measured 2026-11-12 on the 31i at 10.192.233.166:
+            // `00 01 00 03 00 01 00 00 00 00 00 00 00 00` = MEMory / STaRt / motion.
             const d = st.data;
             return {
                 aut:       d.readUInt16BE(0),
@@ -487,21 +564,49 @@ class Focas {
         };
     }
 
+    // cnc_rdprogdir — the program directory. The wire is NOT the PRGDIR ASCII text the
+    // spec describes: it is a fixed 72-byte record per program,
+    //
+    //     number(i32) | length(i32) | comment[64]
+    //
+    // and the arguments are (start, count, format), not the C (type, datano_s,
+    // datano_e, length). Measured 2026-11-12 on the 31i at 10.192.233.166: asking for
+    // (1, 3, 2) returned 216 bytes decoding as 903/28000/"(19237-0903_REVC_150670003)",
+    // 8000/500/"(RENISHAW VECTOR CAL)", 8001/1500/"()"; the C argument order is
+    // answered EW_ATTRIB. See docs/notes.md.
+    //
+    // The loop is bounded three ways because a controller that keeps answering with a
+    // short or malformed block would otherwise spin forever: a malformed frame ends it,
+    // an empty page ends it, and a page that does not advance `start` ends it.
     async listprog(start = 1) {
         const ret = {};
-        while (true) {
-            const st = await this._reqSingle(1, 1, 0x06, start, 0x13, 2);
-            if (st.len < -1) return null;
+        const PAGE = 19;                 // what the node has always asked for
+        for (;;) {
+            const st = await this._reqSingle(1, 1, 0x06, start, PAGE, 2);
+            // A malformed frame is `len: -1`. The old test was `st.len < -1`, which is
+            // never true, so a malformed reply fell through to the record loop, which
+            // did not run, which left `start` where it was — an infinite request loop.
+            if (st.len < 0) return Object.keys(ret).length ? ret : null;
             if (st.len === 0) return ret;
-            for (let t = 0; t + 72 <= st.len; t += 72) {
-                const number  = st.data.readUInt32BE(t);
-                // size       = st.data.readUInt32BE(t+4);
-                let comment   = st.data.slice(t + 8, t + 72);
+
+            const records = Math.floor(st.len / PROGDIR_RECORD_BYTES);
+            let advanced = false;
+            for (let t = 0; t + PROGDIR_RECORD_BYTES <= st.len; t += PROGDIR_RECORD_BYTES) {
+                const number = st.data.readUInt32BE(t);
+                let comment  = st.data.slice(t + 8, t + PROGDIR_RECORD_BYTES);
                 const nullIdx = comment.indexOf(0);
                 if (nullIdx !== -1) comment = comment.slice(0, nullIdx);
-                ret[number] = { comment: comment.toString('ascii') };
-                start = number + 1;
+                // latin1, not ascii: the comment is whatever the CNC's language setting
+                // writes, and ascii decoding turns every non-ASCII byte into '?'.
+                ret[number] = { comment: comment.toString('latin1') };
+                if (number + 1 > start) { start = number + 1; advanced = true; }
             }
+            // A page that did not move `start` forward would re-request the same block.
+            if (!advanced) return ret;
+            // A short page is the last one. This has to be checked on the record count,
+            // not on the byte length: a page of 19 records is 1368 bytes, and comparing
+            // the byte length against PAGE would never match.
+            if (records < PAGE) return ret;
         }
     }
 
@@ -537,12 +642,21 @@ class Focas {
      * msg_len(i32) text. The C ODBALMMSG struct is only 44 bytes because the three short
      * attribute fields are widened to 4 bytes and `dummy` is dropped on the wire.
      *
+     * **The text field is capped at 32 characters.** The spec says so outright and points
+     * at cnc_rdalmmsg2 for the 30i family; this call has no text-length argument in its C
+     * signature at all. The old code sent a fourth argument asking for 64 and computed a
+     * 80-byte stride from it, which would misalign every record if the controller ignored
+     * the argument and answered 32 — silently, because nothing checked that the payload
+     * divided by the stride. The stride is now validated instead.
+     *
      * Throws on a real FOCAS error (e.g. EW_ATTRIB for an out-of-range type) rather than
      * returning [] — an empty array means "no alarms", nothing else.
      */
-    async readalarmcode(type = -1, withtext = 1, maxmsgs = -1, textlength = 32) {
+    async readalarmcode(type = -1, withtext = 1, maxmsgs = -1, textlength = ALM_TEXT_MAX) {
         if (maxmsgs <= 0) maxmsgs = (this.sysinfo && this.sysinfo.maxaxis) || 32;
-        const st = await this._reqSingle(1, 1, 0x23, type, maxmsgs, withtext, textlength);
+        // Clamp rather than trust the caller: anything above 32 is not this function.
+        const textlen = Math.min(Math.max(1, textlength | 0), ALM_TEXT_MAX);
+        const st = await this._reqSingle(1, 1, 0x23, type, maxmsgs, withtext, textlen);
         if (st.len < 0)
             throw new Error(reqErr('cnc_rdalmmsg', st));
         if (st.len === 0) {
@@ -551,7 +665,14 @@ class Focas {
                 throw new Error(reqErr('cnc_rdalmmsg', st, `for type=${type}`));
             return [];
         }
-        const stride = 4 * 4 + textlength;
+        const stride = 4 * 4 + textlen;
+        // A payload that is not a whole number of records means the layout is not what
+        // this decoder assumes. Say so instead of slicing plausible-looking garbage.
+        if (st.len % stride !== 0)
+            throw new Error(
+                `cnc_rdalmmsg: ${st.len} bytes is not a whole number of ` +
+                `${stride}-byte alarm records (type=${type}, textlen=${textlen})`
+            );
         const ret = [];
         for (let pos = 0; pos + stride <= st.len; pos += stride) {
             const entry = {
@@ -561,10 +682,13 @@ class Focas {
             };
             const txlen = st.data.readInt32BE(pos + 12);
             if (txlen > 0 && withtext > 0) {
-                let text = st.data.slice(pos + 16, pos + 16 + textlength);
+                let text = st.data.slice(pos + 16, pos + 16 + textlen);
                 const nullIdx = text.indexOf(0);
                 if (nullIdx !== -1) text = text.slice(0, nullIdx);
-                entry.text = text.toString('ascii').trim();
+                // latin1, not ascii: the spec says the message is Shift-JIS, GB2312,
+                // Code Page 949/1251/1254 or Western European depending on the CNC's
+                // language setting, and ascii decoding turns every one of those into '?'.
+                entry.text = text.toString('latin1').trim();
             } else {
                 entry.text = '';
             }
@@ -644,9 +768,11 @@ class Focas {
     async readpmcalarm(sNumber = 1, readNum = 10) {
         const st = await this._reqSingle(PMC_RDALMMSG_C1, PMC_RDALMMSG_C2,
                                         FN_PMC_RDALMMSG, sNumber, readNum);
-        if (st.len < 0) throw new Error(reqErr('pmc_rdalmmsg', st));
+        // PMC calls answer with the PMC status table, not the CNC one — EW_NOPMC (1),
+        // EW_RANGE (3) and EW_TYPE (4) mean something else there.
+        if (st.len < 0) throw new Error(reqErr('pmc_rdalmmsg', st, '', PMC_ERRORS));
         if (st.len === 0) {
-            if (st.error !== undefined) throw new Error(reqErr('pmc_rdalmmsg', st));
+            if (st.error !== undefined) throw new Error(reqErr('pmc_rdalmmsg', st, '', PMC_ERRORS));
             return { alarms: [], read_num: 0, exist: PMC_ALARM_NO, more: false };
         }
         if (st.len < 8)
@@ -662,7 +788,8 @@ class Focas {
             let text = body.slice(i * stride, (i + 1) * stride);
             const nullIdx = text.indexOf(0);
             if (nullIdx !== -1) text = text.slice(0, nullIdx);
-            alarms.push({ message: text.toString('ascii').trim() });
+            // latin1: the message comes from fwpmcalm.ini, which is not ASCII-only.
+            alarms.push({ message: text.toString('latin1').trim() });
         }
         return { alarms, read_num: readNumGot, exist, more: exist === PMC_ALARM_STILL };
     }
@@ -714,6 +841,16 @@ class Focas {
     }
 
     // ── Macro variables ───────────────────────────────────────────────────────
+    // cnc_rdmacro's second argument is an END variable number, not a count: the vendor
+    // library sends `0x15 args=<number> <number>` for a single read (captured with
+    // tools/probe-dll-param.py on the 31i at 10.192.233.166, 2026-11-12), and the raw
+    // wire answers `(100, 100)` with one record and `(100, 101)` with two. Sending a
+    // count instead — `(100, 10)` — is answered with a malformed frame.
+    //
+    // The record is the same 8-byte shape decode8() handles: mcr_val(i32) |
+    // format(i16) | dec_val(i16). Measured: `07 27 0e 00 00 0a 00 05` = 120000000 at
+    // dec 5 = 1200, and a vacant variable is `00 00 00 00 00 0a ff ff` = dec -1, which
+    // decode8() already reports as null.
     async readmacro(first, last = 0) {
         if (last === 0) last = first;
         const st = await this._reqSingle(1, 1, 0x15, first, last);
@@ -759,16 +896,27 @@ class Focas {
     }
 
     // Two records per spindle (load meter, then motor speed); only the named one is kept.
+    // Reported as a magnitude like the servo meter: the readings are signed on the wire
+    // (measured 2026-11-12 on the 31i at 10.192.233.166 — `0x56[1]` answered
+    // -12, 33, -10, 0, -24), and a regenerating spindle should not read negative here
+    // while the servo meter reads positive.
     async readspmeter(type = SPMETER_LOAD) {
         const count = await this.readaxiscount(AXNUM_SPINDLE);
         const st = await this._reqSingle(1, 1, FN_SPMETER, type, ALLAXIS);
         if (st.len <= 0) throw new Error(reqErr('cnc_rdspmeter', st, `for type=${type}`));
-        return this._loadReadings(st.data, SPMETER_STRIDE, count);
+        return this._loadReadings(st.data, SPMETER_STRIDE, count).map(Math.abs);
     }
 
     // ── Axis / spindle names ──────────────────────────────────────────────────
     // 4-byte records with the name in byte 0 ("X", "S"); the remaining bytes are
-    // not useful on the wire.
+    // not useful on the wire. Measured 2026-11-12 on the 31i at 10.192.233.166:
+    // 0x89 answered `58 00 6e 10 | 59 00 6e 10 | ...` = X, Y, Z, B, X2 at 4 bytes each.
+    //
+    // `data_num` is sent as 0, which is what the vendor library puts on the wire for
+    // both calls (captured with tools/probe-dll-param.py: `0x89 args=0 0 0 0 0`). The
+    // spec says 0 or less is EW_LENGTH, but this controller answers 0 with every name
+    // and rejects the real count — `0x89[5]` on a 5-axis machine is EW_ATTRIB (4) — so
+    // 0 is the form that works. The count only bounds how many records are kept.
     _names(st, count) {
         if (!st || st.len <= 0) return [];
         const n = Math.min(count, Math.floor(st.data.length / 4));
@@ -783,7 +931,7 @@ class Focas {
     }
 
     async readspindlenames(count) {
-        return this._names(await this._reqSingle(1, 1, FN_SPNAME, ALLAXIS), count);
+        return this._names(await this._reqSingle(1, 1, FN_SPNAME, 0), count);
     }
 
     async readservoload() {
@@ -808,43 +956,58 @@ class Focas {
     // cnc_rdtlinfo — management limits, used to size the group read and to compute
     // usage percentages. The block opens with one long that is not part of ODBTLINFO,
     // so the four limits start at +4 (checked against a run where the grouping of
-    // 30/128/8/60000 only lines up this way).
+    // 30/128/8/60000 only lines up this way). Re-measured 2026-11-12 on the 31i at
+    // 10.192.233.166: 20 bytes, `14 | 100 | 4 | 100000 | 99999999`.
+    //
+    // A 16-byte reply is the C ODBTLINFO with no leading long. Accept it rather than
+    // reporting a malformed frame — the two layouts differ only by that prefix.
     async readtlinfo() {
         const st = await this._reqSingle(1, 1, FN_RDTLINFO);
-        if (st.error !== undefined || st.len < ODBTLINFO_BYTES)
+        if (st.error !== undefined || st.len < 16)
             throw new Error(reqErr('cnc_rdtlinfo', st));
         const d = st.data;
+        const off = st.len >= ODBTLINFO_BYTES ? 4 : 0;
         return {
-            max_group:  d.readInt32BE(4),
-            max_tool:   d.readInt32BE(8),
-            max_minute: d.readInt32BE(12),
-            max_cycle:  d.readInt32BE(16),
+            max_group:  d.readInt32BE(off),
+            max_tool:   d.readInt32BE(off + 4),
+            max_minute: d.readInt32BE(off + 8),
+            max_cycle:  d.readInt32BE(off + 12),
         };
     }
 
     // cnc_rdngrp — how many tool groups have at least one tool registered. The count is
     // the first long; reading at +4 (the C struct's `dummy[2]` offset) returns the max
-    // group count instead.
+    // group count instead. Measured 2026-11-12 on the 31i at 10.192.233.166: 20 bytes,
+    // `14 | 100 | 4 | 100000 | 99999999` — the same block cnc_rdtlinfo returns.
+    //
+    // The C ODBTLIFE2 is `short dummy[2]` + `long data`, i.e. 8 bytes with the count at
+    // +4. A controller that answers that shape would have its count read as 0 here, so
+    // the 8-byte form is decoded at +4 instead of being silently reported as "no groups".
     async readngrp() {
         const st = await this._reqSingle(1, 1, FN_RDNGRP);
         if (st.error !== undefined || st.len < ODBTLIFE2_BYTES)
             throw new Error(reqErr('cnc_rdngrp', st));
-        return st.data.readInt32BE(0);
+        return st.data.readInt32BE(st.len >= ODBTLINFO_BYTES ? 0 : 4);
     }
 
     // cnc_rdusegrpid — the group currently in use, the next one, and the selected one.
     // The wire is just three longs: ODBUSEGR's leading `datano`/`type` are documented
     // "not used" and are not sent, so next/use/slct start at +0 (+4/+8/+12 would run off
-    // the end of the 12-byte payload).
+    // the end of the 12-byte payload). Measured 2026-11-12 on the 31i at
+    // 10.192.233.166: 12 bytes, `0 | 2 | 2`.
+    //
+    // A 16-byte reply is the C ODBUSEGR with its two leading shorts. Decoding that at +0
+    // would report `datano|type` as the next group, so the width picks the offset.
     async readusegrpid() {
         const st = await this._reqSingle(1, 1, FN_RDUSEGRPID);
         if (st.error !== undefined || st.len < ODBUSEGR_BYTES)
             throw new Error(reqErr('cnc_rdusegrpid', st));
         const d = st.data;
+        const off = st.len >= 16 ? 4 : 0;
         return {
-            next: d.readInt32BE(0),
-            use:  d.readInt32BE(4),
-            slct: d.readInt32BE(8),
+            next: d.readInt32BE(off),
+            use:  d.readInt32BE(off + 4),
+            slct: d.readInt32BE(off + 8),
         };
     }
 
@@ -880,4 +1043,4 @@ class Focas {
     }
 }
 
-module.exports = { Focas, ALLAXIS, TOOL_GROUP_PAGE };
+module.exports = { Focas, ALLAXIS, TOOL_GROUP_PAGE, ALM_TEXT_MAX, PMC_ERRORS, FOCAS_ERRORS };

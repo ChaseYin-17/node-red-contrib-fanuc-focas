@@ -199,8 +199,13 @@
     <h3>Function</h3>
     <dl class="message-properties">
         <dt>All Data</dt><dd>Full combined payload (controller, state, timers, program, alarms)</dd>
-        <dt>Status Info</dt><dd>mode, run_state, motion, alarm, emergency, edit</dd>
-        <dt>System Info</dt><dd>cnc_type, mt_type, series, version, axes</dd>
+        <dt>Status Info</dt><dd>mode, run_state, motion, alarm, emergency, edit.
+            <code>motion</code> is <code>Stopped</code> / <code>Moving</code> /
+            <code>Dwelling</code> / <code>Waiting</code>; <code>mstb</code> is
+            <code>Finished</code> when the M/S/T/B function has completed.</dd>
+        <dt>System Info</dt><dd>cnc_type, mt_type, series, version, axes, max_axes.
+            <code>axes</code> is the <em>current</em> controlled axis count;
+            <code>max_axes</code> is the maximum the CNC can control.</dd>
         <dt>Timers</dt><dd>power_on, auto_operation, cutting, cycle — with total_seconds and formatted</dd>
         <dt>Axes Data</dt><dd>Position, servo/spindle load, feedrate — select sub-type.
             Servo load returns one value per axis (<code>servo_load_percent</code>, array) alongside
@@ -215,7 +220,8 @@
             and usage percent, plus the in-use / next / selected group. Needs the CNC's
             <em>tool life management</em> option — without it the node reports the
             controller's <code>EW_NOOPT</code>.</dd>
-        <dt>Alarm Messages</dt><dd>Active alarms with type, code, axis, text</dd>
+        <dt>Alarm Messages</dt><dd>Active alarms with type, code, axis, text. Message text is
+            capped at 32 characters by <code>cnc_rdalmmsg</code> on every series.</dd>
         <dt>Alarm Status</dt><dd>The alarm <em>status word</em> (<code>status</code>) plus the
             set bits decoded (<code>bits</code>: bit number and its per-series label). Cheaper
             than the messages and can be set with nothing in <em>Alarm Messages</em> to match

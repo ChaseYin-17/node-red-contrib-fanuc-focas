@@ -315,3 +315,173 @@ exist: -1}` the library does. Nothing has been seen after the 8-byte header, so
 `ODBPMCALM`'s 128 bytes. Re-run the capture on a controller with a PMC alarm up to close
 that.
 
+---
+
+## Audit against the SDK spec, 2026-11-12
+
+Measured on the 31i at **`10.192.233.166:8193`** — `cnc_type` `31`, series `G40A`,
+version `37.0`, `max_axis` 32, **`axes` `"05"`** (5 servo axes `X Y Z B X2`, 1 spindle `S1`).
+Every request in this section is a read; nothing was written, reset or cleared.
+
+The tools that produced it are `tools/probe-readonly-audit.js` (every call the node makes,
+with raw bytes), `tools/probe-param-types.js` (the `cnc_rdparam3` attribute codes),
+`tools/probe-position-compare.js` (`readaxes()` against the vendor library's opcodes),
+`tools/probe-progdir-layout.js` (the 72-byte record) and `tools/probe-dll-param.py` (the
+argument order for param/macro/progdir/names, captured from the vendor DLL through the
+proxy, like `probe-dll-opcode.py`).
+
+### `cnc_rdparam3` — the wire is not the C struct, and the type enum is not the C enum
+
+The vendor library's own request for `cnc_rdparam3(number, axis, length, absolute)` is
+`0x8d args=<number> <number> <axis> 0 0` — the **second argument repeats the parameter
+number**, and the axis travels in the third slot. That is why `focas.js`'s
+`_reqSingle(1, 1, 0x8d, first, last, axis)` works: `first`/`last` are the same number for a
+single-parameter read. Sending the documented C order (`number, axis, length, absolute`)
+instead is answered `EW_NUMBER (3)`.
+
+The response block is **8 bytes per axis**, not 4:
+
+```
+datano(i32) | type(i16) | attr(i16) | record[MAX_AXIS] of 8 bytes
+                                        value(i32) | dec(i32)
+```
+
+`type` is `0xffff` on this controller for every parameter, so it carries nothing. The
+**attribute is the word at +6**, and its enum is *not* the `IODBPSD.type` enum the spec
+documents (`0 bit / 1 byte / 2 word / 3 2-word / 4 real`). Measured by sweeping parameter
+numbers:
+
+| attr at +6 | parameters seen | meaning |
+|---|---|---|
+| 0 | 1000, 1001, 1002, 1004, 1300, 1800, 5000, 5001, 6000, 6700, 9000, 10000, 13000, 18000 | byte / word / 2-word — the value is the i32 at +0 either way |
+| 1 | 1020, 1022, 1023, 1024, 1025, 1026 | **bit** — the value is the byte at +3 (1020 reads `88 89 90 42 88` = `X Y Z B X2`) |
+| 2 | 1825 | word with axis (6000 = the servo loop gain) |
+| 3 | 1850, 6711, 6750 | 2-word with axis (6711 = 23101 parts, 6750 = 3044565 ms) |
+| 4 | 1700, 10000 | **real** — `value(i32)` then `dec(i32)`; 5001 read `64` with dec 0 |
+
+So the old decoder had three faults at once: it read 4-byte records out of an 8-byte
+stride, it took the attribute from `type` at +4 (always `0xffff` here) instead of +6, and it
+had the bit/byte meanings of 0 and 1 swapped relative to the documented enum — which is
+also not the enum this controller uses.
+
+**6711 and 6750 are 2-word parameters, not real ones.** The old code's `valtype === 3`
+branch read the i32 at +0 and got the right number by luck; the `valtype === 4` branch was
+never reached, so a real parameter returned `undefined`.
+
+### `cnc_rdmacro` — the second argument is an END number, and `(n, n)` is the single read
+
+`0x15 args=<number> <end_number>`. The vendor library sends `args=100 100` for
+`cnc_rdmacro(100, 10)` — it rewrites the second argument to the end of the range it wants,
+which for a single variable is the variable number itself. The raw wire agrees:
+
+| args | result |
+|---|---|
+| `(1, 1)` | 8 bytes — one record |
+| `(1, 2)` | 16 bytes — two records |
+| `(1, 10)` | 80 bytes — ten records |
+| `(100, 100)` | 8 bytes — one record, `mcr_val=120000000 dec=5` |
+| `(100, 101)` | 16 bytes — two records |
+| `(100, 10)` | **`len = -1`** — malformed frame |
+| `(500, 1)` | **`len = -1`** — malformed frame |
+
+So the second argument is an end number and must be ≥ the first. `focas.js`'s
+`readmacro(first, last)` already sent `(first, last)` with `last = first` for a single
+read, which is the correct form — the earlier `decode8()` on the record was the real bug:
+the record is `mcr_val(i32) | dec_val(i16) | 2 bytes`, not the 8-byte
+`value/format/dec` shape the feedrate decoder expects, so every macro read came back
+`null`. `dec_val = -1` is the spec's "vacant" marker and is now reported as `null`.
+
+### `cnc_rdprogdir` — 72-byte records, and the arguments are not the C order
+
+`0x06 args=<start> <count> <format>`. The node's `(start, 0x13, 2)` asks for 19 records in
+format 2 and gets `19 × 72 = 1368` bytes; `(1, 3, 2)` gets 216. The record is:
+
+```
+number(i32) | length(i32) | comment[64]
+```
+
+`(1, 3, 2)` decoded: `903 / 28000 / "(19237-0903_REVC_150670003)"`,
+`8000 / 500 / "(RENISHAW VECTOR CAL)"`, `8001 / 1500 / "()"`. So the node's 72-byte stride
+and `number`/`length`/`comment` offsets are **correct** — the layout was right even though
+it is not `PRGDIR`'s ASCII text form. The C order `(type, datano_s, datano_e, length)` is
+answered `EW_ATTRIB (4)`.
+
+### `cnc_rdaxisname` / `cnc_rdspdlname` — 4-byte records, and `data_num` is sent as 0
+
+`0x89 args=<data_num>` returns `data_num × 4` bytes; `0x8a` likewise. The record is
+`name` + `suff` + 2 bytes of padding (`58 00 6e 10` = `"X"`), so the node's 4-byte stride
+is right.
+
+**`data_num` is sent as 0, and that is what works.** The vendor library puts
+`0x89 args=0 0 0 0 0` on the wire for both calls, and the raw wire agrees: `0x89[0]`
+returns all five names, while `0x89[5]` on this 5-axis machine is **`EW_ATTRIB (4)`**.
+The spec says 0 or less is `EW_LENGTH`, and the library's own `cnc_rdaxisname(0)` does
+return `EW_LENGTH` — but the wire form the library actually sends is 0, and that is the
+form the controller answers. The count only bounds how many records are kept.
+
+### `cnc_rdusegrpid` / `cnc_rdngrp` / `cnc_rdtlinfo` — the measured layouts hold
+
+`0x48` → 12 bytes `00 00 00 00 | 00 00 00 02 | 00 00 00 02` (next 0, use 2, slct 2).
+`0x4a` and `0x1c4` → the same 20 bytes `14 | 100 | 4 | 100000 | 99999999`, i.e. group count
+20, max_group 100, max_tool 4, max_minute 100000, max_cycle 99999999. `0x1c1` → 10 records
+of 28 bytes. All three match `docs/notes.md`'s earlier measurement, so the "wire drops the
+C `dummy`" reading is confirmed on a second machine.
+
+### `cnc_rdalmmsg` — no alarm was pending, so the record layout is still open
+
+`0x23` answered `len = 0` for every argument form tried — `(type, num)`, `(type, num, 1,
+32)`, `(type, num, 1, 64)`, `(type, num, 1, 44)` — because this controller has no active
+alarm. **The 16-byte-header record layout is still unmeasured**, and so is whether the
+fourth argument widens the text field. The spec says `cnc_rdalmmsg` is capped at 32
+characters and that `cnc_rdalmmsg2` is the 64-character call for the 30i family, so the
+node now sends the documented 32 and validates the stride instead of assuming 64 works.
+
+### `cnc_rddynamic2` / positions — the node's selectors are not the library's
+
+`0x26` accepts every selector 0..9 and returns 32 × 8-byte records for each, so the
+selector is a *data kind*, not a position type. The vendor library reaches the four
+position types with `0x88[1]`, `0x88[2]`, `0xa3[0,-1]` and `0x26[0,-1]`; `0x88` and `0xa3`
+answer 128-byte blocks that do not decode as 8-byte records at all, while `0x26[0,-1]`
+returns the same shape the node already decodes.
+
+Back to back on this machine, `readaxes()` and the library disagree on which selector is
+which position:
+
+| | node `readaxes()` | library `cnc_rdaxisdata(cls=1)` |
+|---|---|---|
+| absolute | `0x26[4]` → `18.938, 32.945, -2, 0, -308.381` | `0x26[0]` → `19.796, 32.312, -2, 0, -307.522` |
+| machine | `0x26[1]` → `-308.185, -275.171, -496.769, 0, -308.207` | `0x88[1]` |
+| relative | `0x26[6]` → `-308.007, 4.31, -496.565, 0.002, -308.032` | `0x88[2]` |
+| distance | `0x26[7]` → `8.069, -15.866, 0, 0, 0` | `0xa3[0,-1]` |
+
+The absolute values agree to within the machine moving between the two reads, so
+`0x26[4]` and `0x26[0]` are the same quantity. The other three cannot be checked the same
+way because the library's opcodes for them do not decode here. **Left as it is** — the
+node's four selectors return four distinct, plausible position sets, and changing them
+without a way to verify the replacement would be the guess this project forbids. The
+`0x88`/`0xa3` mapping is recorded above for whoever picks it up with a machine that can be
+moved deliberately.
+
+### `cnc_actf` / `cnc_acts` — 8 bytes, `dec` at +6
+
+`0x24` → `00 00 00 c8 00 0a 00 00` = 200 with dec 0; `0x25` → `00 00 09 c4 00 0a 00 00` =
+2500 with dec 0. The 8-byte `value(i32) + format(i16) + dec(i16)` shape `decode8()` assumes
+is confirmed, and `dec` is at +6 as the code says.
+
+### `cnc_rdsvmeter` / `cnc_rdspmeter` — signed values, `dec` at +6
+
+`0x56[1]` → 32 records, first five `-12, 33, -10, 0, -24` at dec 0. `0x56[3]` → the same
+axes at dec 2 (`-1.47, 8.69, -2.79, 0, -2.95` A). `0x40[0,-1]` → 4 records of 16 bytes,
+first `127` at dec 0. **The readings are signed** — a regenerating axis reads negative —
+which is why `readsvmeter()` takes the magnitude and `readspmeter()` did not. Both are
+magnitudes now.
+
+### `cnc_statinfo` — 14 bytes, and `axes` is not `max_axis`
+
+`0x19` → `00 01 00 03 00 01 00 00 00 00 00 00 00 00` = `aut 1 (MEMory)`, `run 3 (STaRt)`,
+`motion 1`, `mstb 0`, `emergency 0`, `alarm 0`, `edit 0`. The 14-byte block and the
+`aut`-first offset are confirmed.
+
+`cnc_sysinfo` on this machine reports `max_axis = 32` and `axes = "05"`. The node's
+`fnSystemInfo()` reported `axes: si.maxaxis`, i.e. **32 for a 5-axis machine**.
+

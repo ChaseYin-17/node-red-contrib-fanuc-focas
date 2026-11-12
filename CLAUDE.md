@@ -18,7 +18,13 @@ Offline checks, **no controller needed** — stub the `Focas` prototype and driv
 ```bash
 node tools/verify-node-toollife-offline.js
 node tools/verify-node-alarms-offline.js
+node tools/verify-decoders-offline.js
 ```
+
+`verify-decoders-offline.js` replays byte strings captured from a real controller, so it
+covers the wire decoders (`cnc_rdparam3`, `cnc_rdmacro`, `cnc_rdprogdir`, `cnc_rdalmmsg`,
+the tool-life layouts, the load meters, `cnc_statinfo`) without hardware. Run it on any
+change to a decoder.
 
 End-to-end checks against a real controller (first arg is the IP, defaults documented in each
 script's header):
@@ -37,9 +43,17 @@ Diagnostics that dump raw frames instead of asserting (all read-only):
 node tools/probe-funcsupport.js <ip>          # which function codes this CNC answers
 node tools/probe-alarms.js <ip>               # raw cnc_rdalmmsg responses
 node tools/probe-toollife.js <ip>             # raw tool-life payloads
+node tools/probe-readonly-audit.js <ip>       # every call the node makes, with raw bytes
+node tools/probe-param-types.js <ip>          # cnc_rdparam3 attribute codes per parameter
+node tools/probe-position-compare.js <ip>     # readaxes() vs the vendor library's opcodes
+node tools/probe-progdir-layout.js <ip>       # the cnc_rdprogdir 72-byte record
 python tools/probe-dll-opcode.py <ip> 8193    # opcodes, captured from the vendor DLL
 python tools/probe-dll-opcode.py --stub       # the same request bytes, no controller needed
+python tools/probe-dll-param.py <ip> 8193     # argument order for param/macro/progdir/names
 ```
+
+Every `probe-*` here is **read-only**: no write, reset, clear or mode change. Keep it that way —
+these run against production machines.
 
 ## The central discipline: opcodes are captured, never guessed
 

@@ -35,7 +35,7 @@ const FOCAS_ERRORS = {
 // 0x56[type] — so its servo load meter is the 0x56 row below, and its "load current
 // (Ampere)" is the same opcode with 3 in place of 1. See docs/notes.md.
 const CASES = [
-    ['cnc_rdprogdir   (listprog)',        0x06, [1, 0x13, 2]],
+    ['cnc_rdprogdir   (listprog)',        0x06, [1, 3, 2]],
     ['cnc_rdmacro     (readmacro)',       0x15, [1, 1]],
     ['cnc_sysinfo',                       0x18, []],
     ['cnc_statinfo',                      0x19, [0]],
@@ -52,9 +52,14 @@ const CASES = [
     ['cnc_rdspmeter   (spindle load, %)', 0x40, [0, -1]],
     ['cnc_rdsvmeter   (servo load, %)',   0x56, [1]],
     ['cnc_rdsvmeter   (load current, A)', 0x56, [3]],
+    // data_num is sent as 0 — that is what the vendor library puts on the wire, and
+    // the real count is rejected (0x89[5] on a 5-axis machine is EW_ATTRIB). See
+    // docs/notes.md.
     ['cnc_rdaxisname  (servo axis names)',0x89, [0]],
-    ['cnc_rdspdlname  (spindle names)',   0x8a, [-1]],
+    ['cnc_rdspdlname  (spindle names)',   0x8a, [0]],
     ['cnc_rdaxisnum   (servo axcount)',   0xa4, [2]],
+    // cnc_rdparam3's wire arguments are (number, number, axis), not the C
+    // (number, axis, length, absolute) — captured from the vendor library.
     ['cnc_rdparam3     (readparam3)',     0x8d, [6711, 6711, -1]],
     ['cnc_rdparam      (readparam3 fall)',0x0e, [6711, 6711, -1]],
     // Tool life. All four need the CNC's "tool life management" option; without it

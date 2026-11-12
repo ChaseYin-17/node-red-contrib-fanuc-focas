@@ -137,11 +137,15 @@ function buildTimer(minVal, msVal = null) {
 async function fnStatusInfo(focas, runModes) {
     const state = await focas.statinfo();
     if (!state) return null;
+    // mstb is 0 = "***" (others) and 1 = FIN — the M/S/T/B function has FINished, not
+    // "is active". motion is 0 = ***, 1 = MoTioN, 2 = DWeLl, so a dwell is not "Moving".
+    // Both labels used to collapse the enum to a boolean. Spec: cnc_statinfo.xml.
+    const MOTION = { 0: 'Stopped', 1: 'Moving', 2: 'Dwelling', 3: 'Waiting' };
     return {
         mode:      state.aut in AUT_MODES ? AUT_MODES[state.aut] : String(state.aut),
         run_state: state.run in runModes ? runModes[state.run] : String(state.run),
-        motion:    state.motion ? 'Moving' : 'Stopped',
-        mstb:      state.mstb   ? 'Active' : 'Inactive',
+        motion:    MOTION[state.motion] ?? `UNKNOWN(${state.motion})`,
+        mstb:      state.mstb === 1 ? 'Finished' : 'Inactive',
         emergency: (state.emegency in EMG_STATES) ? EMG_STATES[state.emegency] : `UNKNOWN(${state.emegency})`,
         alarm:     (state.alarm    in ALM_STATES) ? ALM_STATES[state.alarm]    : `ALARM(${state.alarm})`,
         edit:      state.edit   ? 'Active' : 'Inactive',
@@ -150,12 +154,18 @@ async function fnStatusInfo(focas, runModes) {
 
 async function fnSystemInfo(focas) {
     const si = focas.sysinfo;
+    // `axes` is the CURRENT controlled axis count (ASCII, e.g. "05"), not max_axis.
+    // cnc_sysinfo.xml documents both: max_axis is the maximum the CNC can control,
+    // axes is how many it controls now. Reporting max_axis as `axes` said 32 for a
+    // 5-axis machine (measured 2026-11-12 on the 31i at 10.192.233.166).
+    const cur = parseInt(String(si.axes || '').trim(), 10);
     return {
         cnc_type: si.cnctype.trim(),
         mt_type:  si.mttype.trim(),
         series:   si.series.trim(),
         version:  si.version.trim(),
-        axes:     si.maxaxis,
+        axes:     Number.isNaN(cur) ? null : cur,
+        max_axes: si.maxaxis,
     };
 }
 
@@ -299,19 +309,12 @@ async function fnToolLife(focas) {
 async function fnAlarmMessages(focas, cncSeries) {
     const group = almSeriesGroup(focas, cncSeries);
     const types = ALM_TYPES_BY_GROUP[group];
-    // cnc_rdalmmsg caps a message at 32 chars; the 30i family (incl. 0i-D/F, PMi-A) can
-    // go further and the spec recommends cnc_rdalmmsg2 there.
-    const textlength = group === '30i' ? 64 : 32;
-
-    let alarms;
-    try {
-        alarms = await focas.readalarmcode(ALM_TYPE_ALL, 1, ALARM_MAX_MSGS, textlength);
-    } catch (e) {
-        // Only retry when the CNC itself rejected the request — never after a transport fault.
-        if (textlength === 32 || !/^cnc_rdalmmsg: CNC returned/.test(e.message)) throw e;
-        // Firmware that rejects the extended width still answers the documented 32.
-        alarms = await focas.readalarmcode(ALM_TYPE_ALL, 1, ALARM_MAX_MSGS, 32);
-    }
+    // cnc_rdalmmsg caps a message at 32 characters on every series — the spec says so
+    // and points at cnc_rdalmmsg2 for the 30i family. Asking this call for 64 was never
+    // supported: it has no text-length argument in its C signature, so a controller that
+    // ignored the extra word would have answered 32 and every record would have been
+    // sliced at the wrong stride. The 32 is passed explicitly so the intent is visible.
+    const alarms = await focas.readalarmcode(ALM_TYPE_ALL, 1, ALARM_MAX_MSGS, 32);
 
     return (alarms || []).map(a => ({
         type:      a.alarmtype in types ? types[a.alarmtype] : String(a.alarmtype),

@@ -69,7 +69,11 @@ npm install node-red-contrib-fanuc-focas
 |----------|-------------|----------------------|
 | **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `axes_data`, `tool_life`, `active_alarms`, `alarm_status`, `pmc_alarms`, `errors` |
 | **Status Info** | Machine run state | `mode`, `run_state`, `motion`, `mstb`, `emergency`, `alarm`, `edit` |
-| **System Info** | Controller identity | `cnc_type`, `mt_type`, `series`, `version`, `axes` |
+| **System Info** | Controller identity | `cnc_type`, `mt_type`, `series`, `version`, `axes`, `max_axes` |
+
+> `axes` is the **current** controlled axis count (`cnc_sysinfo`'s `axes`, e.g. `5` on a
+> 5-axis machine); `max_axes` is the maximum the CNC can control (`max_axis`, e.g. `32`).
+> Reporting the maximum as `axes` is a common mistake and it is what this node used to do.
 | **Timers** | Accumulated time counters | `power_on_time`, `auto_operation_time`, `cutting_time`, `cycle_time` |
 | **Axes Data** | Position / load / feed | See sub-types below |
 | **Parameters** | Raw CNC parameters | `{ [param_number]: value, … }` |
@@ -188,8 +192,10 @@ numeric category:
 > CNC type. `type_code` is always the raw value, so a label can be re-derived if the
 > controller is not recognised.
 >
-> Message text is limited to 32 characters by `cnc_rdalmmsg`; the 30i family is read with a
-> 64-character field, falling back to 32 if the firmware rejects it.
+> Message text is limited to 32 characters by `cnc_rdalmmsg` on every series — the spec
+> says so and points at `cnc_rdalmmsg2` for the 30i family. The node sends the documented
+> 32 and validates that the payload is a whole number of records, so a layout mismatch
+> raises instead of silently mis-slicing every alarm.
 
 When **Function** is `Alarm Messages` the payload is an **array**, with the poll timestamp
 attached as a property (not visible when the array is JSON-serialised). Other functions return
@@ -339,11 +345,12 @@ The rules:
 ```json
 {
   "controller": {
-    "cnc_type": "0",
-    "mt_type": "T",
-    "series": "D6G3",
-    "version": "29.0",
-    "axes": 32
+    "cnc_type": "31",
+    "mt_type": "M",
+    "series": "G40A",
+    "version": "37.0",
+    "axes": 5,
+    "max_axes": 32
   },
   "machine_state": {
     "mode": "MEMory",
@@ -458,6 +465,21 @@ You can override the configured function at runtime by setting properties on the
 
 > **Note:** Series 16/18/21/0i/30i `run=0` means reset (not running), not STOP. Using the wrong table is a common source of misclassified machine states.
 
+### motion and mstb Values
+
+Both are enums, not booleans — collapsing them to a flag loses a state:
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| `motion` | `Stopped` | `***` — no axis movement |
+| | `Moving` | `MoTioN` |
+| | `Dwelling` | `DWeLl` — a dwell is not movement |
+| | `Waiting` | `Wait` (TT only) |
+| `mstb` | `Inactive` | `***` — no M/S/T/B function |
+| | `Finished` | `FIN` — the function has **finished**, not "is active" |
+
+> `mstb = 1` means FIN, so it reads `Finished`. Labelling it "Active" inverts the meaning.
+
 ---
 
 ## Multiple Machines
@@ -492,6 +514,8 @@ No additional npm dependencies — uses only Node.js built-ins (`net`, `Buffer`)
 - Wire behaviour is cross-checked against the FANUC FOCAS2 SDK (`docs/FANUC_Focas_API/`) — per-function specs in `Document/SpecE/Misc/`, status codes in `Document/SpecE/ERRCODE.HTM`.
 - The load-meter function codes and their record layout were read off the official library's own traffic: `tools/probe-dll-opcode.py` drives the 64-bit SDK over a local TCP proxy and decodes the frames the vendor DLL puts on the wire, while `tools/probe-funcsupport.js` prints the whole opcode support map for a controller without needing the DLL. Guessing an opcode is what made the load meters silently report `null` — see `tools/verify-node-load.js`.
 - Opcodes are **per-series**, not universal: `cnc_diagnoss` (0x30) answers `EW_FUNC` on a controller that does not implement it, and `cnc_rdparam3` uses a different code on 16i than on 30i/0i-D. Where a function is optional, the node reports the `EW_*` status instead of degrading to `null`.
+- **The wire is not the C struct, and the argument order is not the C signature.** `cnc_rdparam3` sends `(number, number, axis)` and answers 8-byte records with the attribute at +6; `cnc_rdprogdir` sends `(start, count, format)` and answers 72-byte records; `cnc_rdmacro`'s second argument is an end number. All of it was pinned against captured traffic on 2026-11-12 and is written up in [`docs/notes.md`](docs/notes.md). `node tools/verify-decoders-offline.js` guards every decoder with the captured bytes and needs no hardware.
+- **PMC calls use a different status table.** `ERRCODE.HTM` gives the PMC Data Window its own codes — `1` is `EW_NOPMC`, `3` is `EW_RANGE`, `4` is `EW_TYPE` — so a PMC failure is reported with the PMC name rather than the CNC one.
 - The tool-life function codes were read off the vendor library the same way — `0x48` `cnc_rdusegrpid`, `0x4a` `cnc_rdngrp`, `0x1c1` `cnc_rdgrpinfo4`, `0x1c4` `cnc_rdtlinfo`. The wire offsets were then pinned against a controller with the option on (see [`docs/notes.md`](docs/notes.md)). `tools/verify-node-toollife-offline.js` guards the decode, the record model and the paging loop with **no hardware** (36 checks); `tools/verify-node-toollife.js` checks it end to end against a real controller.
 - FOCAS errors are surfaced, not swallowed: a request that the CNC rejects raises (e.g. `cnc_rdalmmsg: CNC returned EW_ATTRIB (4)`). An empty array from `readalarmcode()` therefore means *no alarms*, nothing else.
 - Measured limits of the controllers this has been run against, and the changes deliberately put off for now, are kept in [`docs/notes.md`](docs/notes.md).
