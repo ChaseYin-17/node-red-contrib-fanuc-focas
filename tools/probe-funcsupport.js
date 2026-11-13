@@ -48,7 +48,6 @@ const CASES = [
     ['cnc_rdactfeed   (readactfeed)',     0x24, []],
     ['cnc_rdactspdspeed(readspindlespeed)',0x25, []],
     ['cnc_rddynamic2  (readaxes)',        0x26, [4, -1, 0, 0]],
-    ['cnc_diagnoss    (RETIRED path)',    0x30, [400, 400, -1]],
     ['cnc_rdspmeter   (spindle load, %)', 0x40, [0, -1]],
     ['cnc_rdsvmeter   (servo load, %)',   0x56, [1]],
     ['cnc_rdsvmeter   (load current, A)', 0x56, [3]],
@@ -62,6 +61,14 @@ const CASES = [
     // (number, axis, length, absolute) — captured from the vendor library.
     ['cnc_rdparam3     (readparam3)',     0x8d, [6711, 6711, -1]],
     ['cnc_rdparam      (readparam3 fall)',0x0e, [6711, 6711, -1]],
+    // Tool offsets. 0x08 is BOTH cnc_rdtofs and cnc_rdtofsr, told apart by the argument
+    // pattern: (number, number, 1000+type) reads one, (s, e, type) reads a range.
+    // Captured with tools/probe-dll-tofs.py — the 0x2c/0x2d/0x2e that look adjacent to
+    // the other Ncdata reads are other functions and answer the same bytes for every
+    // argument. See docs/notes.md.
+    ['cnc_rdtofsinfo  (tool offsets)',    0x0a, []],
+    ['cnc_rdtofs      (one offset)',      0x08, [1, 1, 1003]],
+    ['cnc_rdtofsr     (offset range)',    0x08, [1, 5, 0]],
     // Tool life. All four need the CNC's "tool life management" option; without it
     // the controller answers EW_NOOPT (6) — the request itself is still correct.
     ['cnc_rdusegrpid  (tool life group)', 0x48,  []],

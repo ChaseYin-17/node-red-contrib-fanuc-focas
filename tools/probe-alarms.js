@@ -56,10 +56,19 @@ function hexdump(buf) {
 const h = (s) => console.log(`\n${'═'.repeat(74)}\n${s}\n${'═'.repeat(74)}`);
 
 // ── Candidate record decoders ─────────────────────────────────────────────────
-// Layout A — what focas.js readalarmcode() currently assumes:
-//   alm_no i32 @0 | type i32 @4 | axis i32 @8 | msg_len i32 @12 | text @16 (textlen)
+// The record layout is STILL UNMEASURED: every controller this has run against had no
+// alarm pending, so 0x23 answers len=0 and there is nothing to decode. This script is
+// what settles it — run it on a machine with an active alarm and the layout that
+// produces sane alm_no/type/axis/msg_len values is the right one.
+//
+// Layout A — what focas.js readalarmcode() assumes, with the text capped at 32:
+//   alm_no i32 @0 | type i32 @4 | axis i32 @8 | msg_len i32 @12 | text @16 (32)
 // Layout B — FOCAS C struct IODBALMMSG (native short alignment):
 //   alm_no i32 @0 | type i16 @4 | axis i16 @6 | dummy i16 @8 | msg_len i16 @10 | text @12 (32)
+//
+// The text length is 32 on every series — cnc_rdalmmsg has no text-length argument and
+// the spec points at cnc_rdalmmsg2 for the 30i family. The 36/44/64 variants below are
+// kept because they are what would prove that wrong, not because they are expected.
 const LAYOUTS = [
     { name: 'A  (all-int32, text@16)',        stride: (t) => 16 + t, head: 16, textOff: 16, textLen: (t) => t, wide: true },
     { name: 'B  (FOCAS short struct, text@12)', stride: () => 44,   head: 12, textOff: 12, textLen: () => 32, wide: false },
@@ -203,11 +212,14 @@ async function probe(focas, label, c1, c2, c3, args) {
     } catch (e) { console.log('  ✗', e.message); }
 
     // cnc_rdalmmsg (0x23) — vary the argument packing to find what the controller accepts.
+    // 32 is the documented cap and what the node sends. The 36/44 rows are here to prove
+    // the cap wrong if it ever is; a controller that answers them with a payload that is
+    // not a whole number of 32-char records is the evidence needed to change the decoder.
     const VARIANTS = [
         ['type=1, num=10, withtext=1, textlen=32   (what the node sends)', [1, 10, 1, 32]],
         ['type=1, num=1,  withtext=1, textlen=32   (single record)',       [1, 1, 1, 32]],
-        ['type=1, num=10, withtext=1, textlen=36',                         [1, 10, 1, 36]],
-        ['type=1, num=10, withtext=1, textlen=44',                         [1, 10, 1, 44]],
+        ['type=1, num=10, withtext=1, textlen=36   (probe the cap)',       [1, 10, 1, 36]],
+        ['type=1, num=10, withtext=1, textlen=44   (probe the cap)',       [1, 10, 1, 44]],
         ['type=1, num=10, withtext=0, textlen=0    (no text)',             [1, 10, 0, 0]],
         ['type=1, num=10                            (2-arg form)',         [1, 10, 0, 0]],
         ['type=0, num=10, withtext=1, textlen=32   (all groups)',          [0, 10, 1, 32]],
