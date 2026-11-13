@@ -1,7 +1,13 @@
 # FANUC FOCAS2 SDK — proprietary, must not be redistributed.
 # Keep it local only: the node speaks the FOCAS2 wire protocol over TCP and never links it.
 # Referenced by focas.js/README as documentation for the wire format.
+#
+# This path was NOT ignored when the SDK was first added, so 3512 SDK files went into
+# commit 0f5a6a7 and were pushed. The history was rewritten on 2026-11-13 to drop them
+# (git filter-repo --invert-paths --path docs/FANUC_Focas_API); the files stay on the
+# developer's disk and are ignored from here on. Do not remove these two lines.
 lib/
+docs/FANUC_Focas_API/
 
 node_modules/
 .commandcode/
