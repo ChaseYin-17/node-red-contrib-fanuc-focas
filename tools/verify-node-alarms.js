@@ -19,6 +19,9 @@ const configNode = {
     label: () => `${IP}:${PORT}`,
 };
 let pollNode = null;
+// node.warn() calls: the payload has no error channel, so a field that could not be
+// read is reported there instead.
+const warnings = [];
 
 const RED = {
     nodes: {
@@ -26,6 +29,7 @@ const RED = {
             node.on      = (ev, cb) => { node._handlers = Object.assign(node._handlers || {}, { [ev]: cb }); return node; };
             node.status  = (s) => { node._status = s; };
             node.error   = (m) => { node._error = m; };
+            node.warn    = (m) => { warnings.push(m); };
             return node;
         },
         registerType(type, ctor) {
@@ -94,18 +98,21 @@ function poll(msg) {
     const realFeed = Focas.prototype.readactfeed;
     Focas.prototype.readactfeed = async () => { throw new Error('simulated EW_BUFFER (10)'); };
     try {
+        warnings.length = 0;
         const p = (await poll({ function: 'all' })).payload;
         console.log('  feedrate_spindle =', JSON.stringify(p.feedrate_spindle));
-        console.log('  errors           =', JSON.stringify(p.errors));
+        console.log('  warnings         =', JSON.stringify(warnings));
         console.log('  active_alarms    =', p.active_alarms ? `${p.active_alarms.length} entry/entries` : String(p.active_alarms));
         // active_alarms must still be an ARRAY (read cleanly, found nothing is []). It
         // is not required to be non-empty: a controller with no alarm pending answers
         // [] and that is a correct result, not a failure of this case.
         const ok = p.feedrate_spindle.actual_feedrate_mm_min === null
-                && typeof p.errors.actual_feedrate_mm_min === 'string'
+                && !('errors' in p)
+                && warnings.some(w => /actual_feedrate_mm_min/.test(w))
                 && Array.isArray(p.active_alarms)
                 && p.machine_state !== null;
-        console.log(ok ? '  ✔ degraded to null, everything else intact' : '  ✗ unexpected payload');
+        console.log(ok ? '  ✔ degraded to null, reason logged, everything else intact'
+                       : '  ✗ unexpected payload');
     } finally {
         Focas.prototype.readactfeed = realFeed;
     }
@@ -114,9 +121,10 @@ function poll(msg) {
     const realAlarm = Focas.prototype.readalarmcode;
     Focas.prototype.readalarmcode = async () => { throw new Error('cnc_rdalmmsg: CNC returned EW_NOOPT (6) for type=-1'); };
     try {
+        warnings.length = 0;
         const p = (await poll({ function: 'all' })).payload;
         console.log('  active_alarms =', JSON.stringify(p.active_alarms));
-        console.log('  errors        =', JSON.stringify(p.errors));
+        console.log('  warnings      =', JSON.stringify(warnings));
         console.log('  machine_state =', JSON.stringify(p.machine_state));
         console.log(p.active_alarms === null
             ? '  ✔ null (distinguishable from [] = "no alarms")'

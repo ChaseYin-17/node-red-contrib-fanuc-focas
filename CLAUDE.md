@@ -19,12 +19,15 @@ Offline checks, **no controller needed** — stub the `Focas` prototype and driv
 node tools/verify-node-toollife-offline.js
 node tools/verify-node-alarms-offline.js
 node tools/verify-decoders-offline.js
+node tools/verify-tier12-offline.js
 ```
 
 `verify-decoders-offline.js` replays byte strings captured from a real controller, so it
 covers the wire decoders (`cnc_rdparam3`, `cnc_rdmacro`, `cnc_rdprogdir`, `cnc_rdalmmsg`,
-the tool-life layouts, the load meters, `cnc_statinfo`) without hardware. Run it on any
-change to a decoder.
+the tool-life layouts, the load meters, `cnc_statinfo`) without hardware. `verify-tier12-offline.js`
+does the same for the identity/context reads (`cnc_rdcncid`, `cnc_rdzofs`, `cnc_rdseqnum`,
+`cnc_rdcommand`, `cnc_rdproginfo`, `cnc_rdpm_item`, `cnc_rdblkcount`, `cnc_gettimer`,
+`cnc_statinfo2`, `pmc_rdpmcrng`). Run both on any change to a decoder.
 
 End-to-end checks against a real controller (first arg is the IP, defaults documented in each
 script's header):
@@ -35,6 +38,7 @@ node tools/verify-node-axes.js <ip> [port]
 node tools/verify-node-toollife.js <ip> [port]
 node tools/verify-node-alarms.js <ip> [port]
 node tools/verify-node-sessions.js <ip> [port]
+node tools/verify-node-tier12.js <ip> [port]   # identity/context/PMC reads
 ```
 
 Diagnostics that dump raw frames instead of asserting (all read-only):
@@ -48,8 +52,12 @@ node tools/probe-param-types.js <ip>          # cnc_rdparam3 attribute codes per
 node tools/probe-position-compare.js <ip>     # readaxes() vs the vendor library's opcodes
 node tools/probe-progdir-layout.js <ip>       # the cnc_rdprogdir 72-byte record
 node tools/probe-tofs.js <ip>                 # tool-offset reads (0x08 / 0x0a)
+node tools/probe-tier12-layout.js <ip>        # identity/context/PMC response bytes
+node tools/probe-tier12-verify.js <ip>        # the layouts one sample could not pin
+node tools/probe-pmc-byteorder.js <ip>        # pmc_rdpmcrng byte order per width
 python tools/probe-dll-opcode.py <ip> 8193    # opcodes, captured from the vendor DLL
 python tools/probe-dll-opcode.py --stub       # the same request bytes, no controller needed
+python tools/probe-dll-opcode.py --stub --tier12  # ... plus the identity/context/PMC set
 python tools/probe-dll-param.py <ip> 8193     # argument order for param/macro/progdir/names
 python tools/probe-dll-tofs.py <ip> 8193      # argument order for the tool-offset reads
 ```
@@ -126,13 +134,19 @@ Convenient coincidence, verified in the spec: `cnc_rdalmmsg`'s `type` index and
 ## Payload contract
 
 `All Data` reads every field through a `read(key, fn)` helper so one failure degrades **only
-that field**: the field becomes `null` and the reason lands in `errors[key]`. The single-value
-Functions raise instead. A field that is `[]` means "read cleanly, found nothing" and is
-deliberately distinguishable from `null`.
+that field**: the field becomes `null` and the reason goes to the Node-RED log through the
+`log(key, err)` callback the node passes into `collect(...)`. The single-value Functions raise
+instead.
+
+**The payload carries no error channel.** It is pure data, so a consumer can map it straight
+onto OPC UA / MQTT / a database without filtering out a diagnostic key. `null` means "not
+read", `[]` means "read cleanly, found nothing", and a number means the controller reported
+that number — the three are deliberately distinguishable, and that distinction is the whole
+reason the log callback exists.
 
 Adding a field to `All Data` is not a local change: the offline verify scripts stub the `Focas`
 prototype by hand, and `tools/verify-node-toollife-offline.js` asserts that a clean `All Data`
-run leaves `errors` **empty**. A new field with no stub fails that test — add the stub
+run produces **no warnings**. A new field with no stub fails that test — add the stub
 alongside the new reader.
 
 Arrays keep the poll `timestamp` as a *property* (object-spreading a list would turn it into
@@ -142,7 +156,18 @@ Any change to a payload shape means updating `README.md`, `fanuc-focas.html`'s h
 
 `fanuc-focas.js` throws at load time if `focas.js` is missing something it calls (currently
 `TOOL_GROUP_PAGE`, `readalarmstatus2`, `readpmcalarm`, `readtofsinfo`, `readtofs`,
-`tofsTypeName`) — the two files must be updated together.
+`tofsTypeName`, plus the identity/context set `readcncid`, `readzofsinfo`, `readzofs`,
+`readseqnum`, `readcommand`, `readproginfo`, `readpm_item`, `readblkcount`, `gettimer`,
+`statinfo2`, `readpmc`, and the `PMC_AREAS`/`PMC_BYTE` exports) — the two files must be
+updated together.
+
+**Two reads are deliberately absent and must stay that way without new evidence.**
+`cnc_rdexecprog` (`0x20`) has its opcode captured, but its spec page says the execution
+pointer moves to the next block under single-block operation and that has not been disproved
+on a machine that could be watched. `cnc_rdopmsg3` (`0xd0`) answered the `cnc_sysinfo` block
+on every call regardless of its arguments — the signature of a wrong opcode — so it has no
+decoder. Both are written up in `docs/notes.md`; do not add either from the captured opcode
+alone.
 
 ## Conventions
 

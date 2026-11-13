@@ -43,6 +43,9 @@ const real = {
 
 // ── Node-RED stub ─────────────────────────────────────────────────────────────
 let FanucNode = null, pollNode = null;
+// node.warn() calls, collected: the payload has no error channel, so a field that
+// could not be read is reported there instead.
+const warnings = [];
 
 const RED = {
     nodes: {
@@ -50,6 +53,9 @@ const RED = {
             node.on     = (ev, cb) => { node._handlers = Object.assign(node._handlers || {}, { [ev]: cb }); return node; };
             node.status = () => {};
             node.error  = () => {};
+            // The payload has no error channel, so a field that could not be read is
+            // reported through node.warn(). Collect them so the tests can assert on it.
+            node.warn   = (m) => { warnings.push(m); };
             return node;
         },
         registerType(type, ctor) { if (type === 'fanuc-focas') FanucNode = ctor; },
@@ -100,6 +106,25 @@ function stubPeripherals() {
     Focas.prototype.readtofsr           = async (s, e) => Array.from(
         { length: e - s + 1 }, (_, i) => ({ value: i + 1, raw: (i + 1) * 1000, dec: 3, unit: 10 }));
     Focas.prototype.tofsTypeName        = (t) => `type ${t}`;
+
+    // The tier-1/2 fields All Data carries. A clean run must leave `errors` empty,
+    // so every one of them needs a stub here — a new field with no stub fails that
+    // check, which is the point: it is the reminder to add the stub alongside the
+    // reader. See CLAUDE.md, "Payload contract".
+    Focas.prototype.readcncid           = async () => ({ hex: '00000001-00000002-00000003-00000004',
+                                                         values: [1, 2, 3, 4] });
+    Focas.prototype.readseqnum          = async () => 20;
+    Focas.prototype.readcommand         = async () => [];
+    Focas.prototype.readproginfo        = async () => ({ registered: 0, available: 0,
+                                                         used_mem: 0, unused_mem: 0 });
+    Focas.prototype.readpm_item         = async () => [];
+    Focas.prototype.readblkcount        = async () => 0;
+    Focas.prototype.gettimer            = async () => ({ year: 2026, month: 11, day: 13,
+                                                         hour: 16, minute: 56, second: 35 });
+    Focas.prototype.statinfo2           = async () => ({ hdck: 0, tmmode: 0, aut: 1, run: 3,
+                                                         motion: 0, mstb: 0, emergency: 0,
+                                                         alarm: 0, edit: 0, warning: 0,
+                                                         o3dchk: 0, ext_opt: 0, restart: 0 });
 }
 
 // ── Section 1: wire offsets ───────────────────────────────────────────────────
@@ -182,7 +207,7 @@ async function model() {
           'life unset -> remaining and usage null, never 0');
     check(tl.most_used_group === 4,
           `most_used_group = ${tl.most_used_group} (highest usage, not the 0% group 2)`);
-    check(Object.keys(tl.errors).length === 0, 'errors empty when every read succeeds');
+    check(!('errors' in tl), 'tool_life carries no error channel');
 
     h('2b — remaining falls back to life - counter, and prefers life_rest when set');
     modelStubs([
@@ -237,18 +262,24 @@ async function paging() {
     // Same, but the count is unavailable: max_group has to stop it before EW_NUMBER.
     calls = []; pageFn = seq(64);
     Focas.prototype.readngrp = async () => { throw new Error('cnc_rdngrp: CNC returned EW_NOOPT (6)'); };
+    warnings.length = 0;
     tl = (await poll({})).payload;
     check(calls.length === 1 && calls.every(n => n <= 64), `max_group caps it (asked for ${calls.join(',')})`);
-    check(tl.group_count === 0 && /EW_NOOPT/.test(tl.errors.readngrp || ''),
-          `failed count surfaced, not swallowed: ${JSON.stringify(tl.errors)}`);
+    check(tl.group_count === 0 && !('errors' in tl),
+          `failed count leaves the field at 0 and no error channel: ${JSON.stringify(tl.group_count)}`);
+    check(warnings.some(w => /readngrp/.test(w) && /EW_NOOPT/.test(w)),
+          `the reason goes to the node log: ${JSON.stringify(warnings)}`);
 
     h('3b — a failing limit read is reported, not zeroed silently');
     calls = []; pageFn = seq(30);
     Focas.prototype.readtlinfo = async () => { throw new Error('cnc_rdtlinfo: CNC returned EW_NOOPT (6)'); };
     Focas.prototype.readngrp   = async () => 30;
+    warnings.length = 0;
     tl = (await poll({})).payload;
-    check(tl.max_group === 0 && /EW_NOOPT/.test(tl.errors.readtlinfo || ''),
-          `tool_life.errors.readtlinfo = ${JSON.stringify(tl.errors.readtlinfo)}`);
+    check(tl.max_group === 0 && !('errors' in tl),
+          `max_group falls back to 0 with no error channel: ${tl.max_group}`);
+    check(warnings.some(w => /readtlinfo/.test(w) && /EW_NOOPT/.test(w)),
+          `the reason goes to the node log: ${JSON.stringify(warnings)}`);
     check(tl.groups.length === 30 && tl.using_group === 2, 'the groups still come back');
 }
 
@@ -258,6 +289,7 @@ async function allData() {
     stubPeripherals();
     modelStubs([g(1, 500, 412), g(2, 500, 0)]);
     makeNode('all');
+    warnings.length = 0;          // section 3b deliberately left a warning behind
     const p = (await poll({})).payload;
 
     check(p.axes_data && Array.isArray(p.axes_data.servo_load_percent),
@@ -271,7 +303,8 @@ async function allData() {
           keys.indexOf('servo_load_current_amps') < keys.indexOf('spindle_load_percent'),
           `servo readings sit together: ${keys.join(', ')}`);
     check(p.feedrate_spindle && 'actual_feedrate_mm_min' in p.feedrate_spindle, 'feedrate_spindle kept');
-    check(p.errors && Object.keys(p.errors).length === 0, 'no fields degraded');
+    check(!('errors' in p), 'All Data carries no error channel');
+    check(warnings.length === 0, `no field degraded (warnings: ${JSON.stringify(warnings)})`);
 }
 
 // ── Section 5: failure shapes ─────────────────────────────────────────────────

@@ -1,10 +1,14 @@
 'use strict';
-let Focas, ALLAXIS, TOOL_GROUP_PAGE;
+let Focas, ALLAXIS, TOOL_GROUP_PAGE, PMC_AREAS, PMC_BYTE, PMC_WORD, PMC_LONG;
 try {
     const m = require('./focas');
     Focas           = m.Focas;
     ALLAXIS         = m.ALLAXIS;
     TOOL_GROUP_PAGE = m.TOOL_GROUP_PAGE;
+    PMC_AREAS       = m.PMC_AREAS;
+    PMC_BYTE        = m.PMC_BYTE;
+    PMC_WORD        = m.PMC_WORD;
+    PMC_LONG        = m.PMC_LONG;
     if (typeof Focas !== 'function') {
         throw new Error(
             `focas.js exported Focas as '${typeof Focas}' (expected a class). ` +
@@ -23,13 +27,25 @@ try {
     // "readalarmstatus2 is not a function" at poll time, once per poll, instead of a
     // load-time error naming the file that needs updating.
     for (const method of ['readalarmstatus2', 'readpmcalarm',
-                          'readtofsinfo', 'readtofs', 'tofsTypeName']) {
+                          'readtofsinfo', 'readtofs', 'tofsTypeName',
+                          // tier-1/2 reads
+                          'readcncid', 'readzofsinfo', 'readzofs', 'readseqnum',
+                          'readcommand', 'readproginfo', 'readpm_item',
+                          'readblkcount', 'gettimer', 'statinfo2', 'readpmc']) {
         if (typeof Focas.prototype[method] !== 'function') {
             throw new Error(
                 `focas.js has no Focas.prototype.${method}. ` +
                 `focas.js and fanuc-focas.js are out of sync — update them together.`
             );
         }
+    }
+    // readpmc takes these; an older focas.js would pass undefined as the area code and
+    // the controller would answer EW_RANGE for every read.
+    if (!PMC_AREAS || typeof PMC_AREAS.D !== 'number' || typeof PMC_BYTE !== 'number') {
+        throw new Error(
+            `focas.js did not export PMC_AREAS / PMC_BYTE. ` +
+            `focas.js and fanuc-focas.js are out of sync — update them together.`
+        );
     }
 } catch (e) {
     throw new Error(`node-red-contrib-fanuc-focas: failed to load focas.js — ${e.message}`);
@@ -48,6 +64,10 @@ const RUN_MODES_15 = {
     5:'PRSR', 6:'NSRC', 7:'ReSTaRt*', 8:'ReSET', 13:'HPCC',
 };
 const EMG_STATES = { 0:null, 1:'EMERGENCY', 2:'RESET', 3:'WAIT' };
+// motion is 0 = ***, 1 = MoTioN, 2 = DWeLl, 3 = WAIT. Module-level so fnStatusInfo
+// and fnStatusInfo2 label it the same way — the same field must not be `Moving` from
+// one function and `1` from the other.
+const MOTION = { 0: 'Stopped', 1: 'Moving', 2: 'Dwelling', 3: 'Waiting' };
 const ALM_STATES = {
     0:null, 1:'ALARM', 2:'BATTERY LOW', 3:'FAN',
     4:'PS WARNING', 5:'FSSB WARNING', 6:'INSULATE WARNING',
@@ -141,7 +161,6 @@ async function fnStatusInfo(focas, runModes) {
     // mstb is 0 = "***" (others) and 1 = FIN — the M/S/T/B function has FINished, not
     // "is active". motion is 0 = ***, 1 = MoTioN, 2 = DWeLl, so a dwell is not "Moving".
     // Both labels used to collapse the enum to a boolean. Spec: cnc_statinfo.xml.
-    const MOTION = { 0: 'Stopped', 1: 'Moving', 2: 'Dwelling', 3: 'Waiting' };
     return {
         mode:      state.aut in AUT_MODES ? AUT_MODES[state.aut] : String(state.aut),
         run_state: state.run in runModes ? runModes[state.run] : String(state.run),
@@ -254,17 +273,23 @@ function pickMostUsedGroup(groups) {
 // Tool-life overview (cnc_rdgrpinfo4 + cnc_rdtlinfo + cnc_rdngrp + cnc_rdusegrpid).
 // Needs the CNC's "tool life management" option; without it the per-group read is
 // what surfaces EW_NOOPT. The limits and the group count are display aids, so a
-// failure there falls back to zero rather than sinking the whole item — the reason is
-// recorded in `errors` so a zero is never mistaken for a reading that was not taken.
-async function fnToolLife(focas) {
-    const errors = {};
+// failure there falls back to zero rather than sinking the whole item.
+//
+// A failed sub-read is NOT reported in the payload. It is logged through `log` so the
+// reason is still recoverable from the Node-RED log, but the payload carries only data:
+// a zero here means "the controller said zero", and a caller that needs to know whether
+// the option is fitted should call the Tool Life function, which raises.
+async function fnToolLife(focas, log) {
     let info = { max_group: 0, max_tool: 0, max_minute: 0, max_cycle: 0 };
     let groupCount = 0;
     let use = { next: 0, use: 0, slct: 0 };
 
-    try { info = await focas.readtlinfo(); }    catch (e) { errors.readtlinfo   = e.message || String(e); }
-    try { groupCount = await focas.readngrp(); } catch (e) { errors.readngrp     = e.message || String(e); }
-    try { use = await focas.readusegrpid(); }   catch (e) { errors.readusegrpid = e.message || String(e); }
+    try { info = await focas.readtlinfo(); }
+    catch (e) { log('tool_life.readtlinfo', e); }
+    try { groupCount = await focas.readngrp(); }
+    catch (e) { log('tool_life.readngrp', e); }
+    try { use = await focas.readusegrpid(); }
+    catch (e) { log('tool_life.readusegrpid', e); }
 
     const usingGroup = use.use > 0 ? use.use : null;
 
@@ -303,7 +328,6 @@ async function fnToolLife(focas) {
         selected_group:  use.slct > 0 ? use.slct : null,
         groups,
         most_used_group: pickMostUsedGroup(groups),
-        errors,
     };
 }
 
@@ -512,15 +536,262 @@ async function fnMacro(focas, macroNums) {
     return result;
 }
 
+// ── Tier-1/2 reads ───────────────────────────────────────────────────────────
+// Every function below is read-only and none of them pauses CNC-side history
+// sampling. Their opcodes and wire layouts were captured on 2026-11-13 and are
+// written up in docs/notes.md.
+//
+// Series support is NOT uniform. From each function's SpecE <support> table
+// (O = both, E = Ethernet only, H = HSSB only, X = cannot be used) — this node is
+// Ethernet, so H and X both mean "not on this machine":
+//
+//   cnc_rdcncid     0i-D/F, 30i only
+//   cnc_statinfo2   0i-D/F, 30i only
+//   cnc_rdpm_item   16i-B and later
+//   cnc_rdcommand   15i, 0i-D/F, 30i (NOT 16i/18i/21i — those need cnc_modal)
+//   the rest        15i and later, but HSSB-only on the non-i series
+//
+// A failure there is EW_FUNC (1) or EW_NODLL (-15), which is "this series does not
+// have it", not a fault. That is why these are NOT in All Data's mandatory path.
+
+// The machine's stable identity. This is the only identifier here that survives a
+// software upgrade, so a multi-machine deployment should key on it rather than on
+// cnc_sysinfo's series/version, which every machine of the same model shares.
+async function fnMachineId(focas) {
+    const id = await focas.readcncid();
+    return { cncid: id.hex, cncid_values: id.values };
+}
+
+// Work-zero offsets: the count, then one value per offset per axis. The axis count
+// comes from the controller, never from the configured maximum.
+async function fnWorkZeroOffsets(focas, maxAxis) {
+    const info = await focas.readzofsinfo();
+    const useNo = Math.max(0, info.use_no | 0);
+    const axes = Math.max(1, maxAxis | 0);
+
+    const offsets = [];
+    for (let n = 1; n <= useNo; n++) {
+        const entry = { number: n, values: {} };
+        for (let a = 1; a <= axes; a++) {
+            try {
+                const r = await focas.readzofs(n, a);
+                entry.values[a] = { value: r.value, raw: r.raw, dec: r.dec, unit: r.unit };
+            } catch (e) {
+                // An axis the table does not have answers EW_ATTRIB; that is a
+                // property of the table, not a failure of the read.
+                entry.values[a] = null;
+            }
+        }
+        offsets.push(entry);
+    }
+    return { use_no: info.use_no, axis_count: axes, offsets };
+}
+
+// Sequence number of the block being executed. A program with no N numbers leaves
+// this at the last one it saw, so it is a progress hint, not an exact position.
+async function fnSequenceNumber(focas) {
+    return { sequence_number: await focas.readseqnum() };
+}
+
+// Modal and commanded F/S/T/B. `present` comes from flag bit 0x0800, which is what
+// separates "no command" from "command is zero".
+async function fnCommand(focas, which) {
+    const type = which === 'commanded' ? -2 : -1;
+    const records = await focas.readcommand(type, 1);
+    const out = {};
+    for (const r of records) {
+        if (!r.present) continue;
+        // M codes carry a number (M1..M5); the others do not.
+        const key = r.number ? `${r.address}${r.number}` : r.address;
+        out[key] = { value: r.value, raw: r.raw, dec: r.dec, address: r.address, number: r.number };
+    }
+    return { block: which === 'commanded' ? 'commanded' : 'modal', commands: out };
+}
+
+// Program memory: registered/available programs and used/unused memory.
+async function fnProgramMemory(focas) {
+    const p = await focas.readproginfo();
+    const total = p.used_mem + p.unused_mem;
+    return {
+        registered_programs: p.registered,
+        available_programs:  p.available,
+        used_memory:         p.used_mem,
+        unused_memory:       p.unused_mem,
+        // A percentage needs a denominator; 0 total is null, not 0 %.
+        used_percent: total > 0 ? Math.round(p.used_mem * 1000 / total) / 10 : null,
+    };
+}
+
+// The CNC's maintenance items. `total`/`remain` are in whatever unit `type` selects
+// and the interface does not return that unit, so the raw numbers are kept.
+async function fnMaintenance(focas) {
+    const items = await focas.readpm_item(1, 10);
+    return {
+        items: items.map((it, i) => ({
+            index:  i + 1,
+            name:   it.name || null,
+            type:   it.type,
+            total:  it.total,
+            remain: it.remain,
+            stat:   it.stat,
+            // A percentage needs a denominator; 0 total is null, not 0 %.
+            remain_percent: it.total > 0
+                ? Math.round(it.remain * 1000 / it.total) / 10
+                : null,
+        })),
+    };
+}
+
+// The block counter. Needs the program-restarting option; without it the controller
+// answers EW_NOOPT (6), which is "not fitted", not a fault.
+async function fnBlockCount(focas) {
+    return { block_count: await focas.readblkcount() };
+}
+
+// The CNC calendar. One call returns both date and time; focas.js reads twice
+// because the first call of a session can carry stale bytes in the tail.
+async function fnCalendar(focas) {
+    const t = await focas.gettimer();
+    const pad = (v, n = 2) => String(v).padStart(n, '0');
+    return {
+        year: t.year, month: t.month, day: t.day,
+        hour: t.hour, minute: t.minute, second: t.second,
+        date: `${pad(t.year, 4)}-${pad(t.month)}-${pad(t.day)}`,
+        time: `${pad(t.hour)}:${pad(t.minute)}:${pad(t.second)}`,
+        // The CNC clock carries no timezone. Do not label it UTC or local.
+        iso_like: `${pad(t.year, 4)}-${pad(t.month)}-${pad(t.day)}T` +
+                  `${pad(t.hour)}:${pad(t.minute)}:${pad(t.second)}`,
+    };
+}
+
+// The extended run status. Only 0i-D/F and 30i have it; elsewhere it is EW_FUNC.
+//
+// The fields that cnc_statinfo also reports are labelled with the SAME tables
+// fnStatusInfo uses, so a flow can read either function and get the same strings.
+// Returning raw enums here would mean the same field is `MEMory` from one function
+// and `1` from the other, which is a trap for whoever wires them together.
+// The fields cnc_statinfo does not have (warning, o3d_check, ext_option, restart)
+// are raw: their enums are not the same across series and nothing here interprets
+// them.
+async function fnStatusInfo2(focas, runModes) {
+    const s = await focas.statinfo2();
+    return {
+        handle_retrace: s.hdck,
+        tm_mode:        s.tmmode,
+        mode:           s.aut in AUT_MODES ? AUT_MODES[s.aut] : String(s.aut),
+        run_state:      s.run in runModes ? runModes[s.run] : String(s.run),
+        motion:         MOTION[s.motion] ?? `UNKNOWN(${s.motion})`,
+        mstb:           s.mstb === 1 ? 'Finished' : 'Inactive',
+        emergency:      (s.emergency in EMG_STATES) ? EMG_STATES[s.emergency]
+                                                    : `UNKNOWN(${s.emergency})`,
+        alarm:          (s.alarm in ALM_STATES) ? ALM_STATES[s.alarm] : `ALARM(${s.alarm})`,
+        edit:           s.edit ? 'Active' : 'Inactive',
+        // Not in cnc_statinfo; raw, because the enum is per-series.
+        warning:        s.warning,
+        o3d_check:      s.o3dchk,
+        ext_option:     s.ext_opt,
+        restart:        s.restart,
+    };
+}
+
+// ── PMC data window ──────────────────────────────────────────────────────────
+// The one read here that reaches machine-builder signals rather than FANUC's own
+// data: door interlocks, clamps, cycle-complete, counters, whatever the ladder
+// exposes. The address map is the machine builder's, so nothing here interprets it.
+//
+// `params` is a comma-separated list of specs, each `<area><address>[:<type>]`:
+//
+//     R0.0        one bit of R0
+//     R0          R0 as a byte
+//     D100:word   D100 as a 16-bit word
+//     D100:long   D100 as a 32-bit long
+//     K0.0        one bit of K0
+//
+// A bit spec reads the byte holding the bit and masks it here, because the wire
+// returns one byte per bit and the caller should not have to know that.
+// The PMC data-type ENUM (FwSymbol.h: byte 0, word 1, long 2) is not the byte
+// WIDTH of that type (1, 2, 4). Keeping them apart matters: passing the enum where a
+// width is expected asks for a 1-byte range and the controller answers 1 byte.
+const PMC_TYPE_NAMES = { byte: PMC_BYTE, word: PMC_WORD, long: PMC_LONG };
+const PMC_TYPE_WIDTH = { byte: 1, word: 2, long: 4 };
+
+function parsePmcSpec(spec) {
+    const m = /^([A-Za-z])\s*(\d+)(?:\.(\d+))?(?::(byte|word|long))?$/.exec(String(spec).trim());
+    if (!m) return null;
+    const area = m[1].toUpperCase();
+    if (PMC_AREAS[area] === undefined) return null;
+    const address = parseInt(m[2], 10);
+    const bit = m[3] === undefined ? null : parseInt(m[3], 10);
+    if (bit !== null && (bit < 0 || bit > 7)) return null;
+    // A bit spec reads the byte holding the bit; anything else defaults to byte.
+    const typeName = m[4] || 'byte';
+    return { spec: String(spec).trim(), area, address, bit, typeName };
+}
+
+async function fnPmcRead(focas, params) {
+    const specs = String(params || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (specs.length === 0) {
+        throw new Error('PMC read: params is empty — give at least one address, e.g. "R0.0,D100:word"');
+    }
+    if (specs.length > 128) {
+        throw new Error(`PMC read: ${specs.length} addresses requested, the limit is 128`);
+    }
+
+    const parsed = specs.map(parsePmcSpec);
+    const bad = specs.filter((s, i) => parsed[i] === null);
+    if (bad.length) {
+        throw new Error(
+            `PMC read: cannot parse ${bad.map(s => JSON.stringify(s)).join(', ')} — ` +
+            `expected <area><address>[:byte|word|long] or <area><address>.<bit>, ` +
+            `areas ${Object.keys(PMC_AREAS).join('/')}`
+        );
+    }
+
+    const values = [];
+    for (const p of parsed) {
+        // The byte WIDTH of the requested type, not its enum value.
+        const width = PMC_TYPE_WIDTH[p.typeName];
+        const end = p.address + width - 1;
+        const raw = await focas.readpmc(p.area, p.address, end, PMC_BYTE);
+
+        if (p.bit !== null) {
+            const byte = raw[0];
+            values.push({
+                spec: p.spec, area: p.area, address: p.address, bit: p.bit,
+                value: (byte >> p.bit) & 1,
+                byte,
+            });
+        } else {
+            // readpmc was asked for bytes; assemble the wider value here so there is
+            // one ordering rule (little-endian within each 2-byte word) rather than
+            // three. See decodePmcBytes in focas.js.
+            let value;
+            if (width === 1) value = raw[0];
+            else if (width === 2) value = raw[0] | (raw[1] << 8);
+            else value = (raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24)) >>> 0;
+            values.push({
+                spec: p.spec, area: p.area, address: p.address, bit: null,
+                type: p.typeName, value,
+                hex: '0x' + value.toString(16).padStart(width * 2, '0'),
+            });
+        }
+    }
+    return { values };
+}
+
 // ── All-in-one (legacy behaviour) ────────────────────────────────────────────
-async function fnAll(focas, runModes, cncSeries) {
+async function fnAll(focas, runModes, cncSeries, log) {
     // Each field is read independently: one failing function degrades that field to null
-    // instead of blanking the whole snapshot. The reason lands in `errors`, keyed by the
-    // payload field it belongs to, so a null is never mistaken for "read cleanly, empty".
-    const errors = {};
+    // instead of blanking the whole snapshot.
+    //
+    // The payload carries NO error channel. A failed field is `null` and the reason goes
+    // to the Node-RED log through `log`, so the payload stays pure data — a consumer can
+    // map it straight onto OPC UA / MQTT / a database without filtering out a diagnostic
+    // key. `null` means "not read"; `[]` means "read cleanly, found nothing"; a number
+    // means the controller reported that number.
     const read = async (key, fn) => {
         try { return await fn(); }
-        catch (e) { errors[key] = e.message || String(e); return null; }
+        catch (e) { log(key, e); return null; }
     };
 
     const status  = await read('machine_state',      () => fnStatusInfo(focas, runModes));
@@ -534,13 +805,38 @@ async function fnAll(focas, runModes, cncSeries) {
     const feed    = await read('actual_feedrate_mm_min', () => focas.readactfeed());
     const spindle = await read('actual_spindle_rpm',     () => focas.readactspindlespeed());
     const axes    = await read('axes_data',          () => fnAxesDataAll(focas));
-    const tlife   = await read('tool_life',          () => fnToolLife(focas));
+    const tlife   = await read('tool_life',          () => fnToolLife(focas, log));
     const tofs    = await read('tool_offsets',       () => fnToolOffsets(focas));
+
+    // ── tier-1/2 fields ──────────────────────────────────────────────────────
+    // These are in All Data because each one is a single cheap read, and each
+    // degrades to null on a series that does not have it.
+    //
+    // They are NOT free on an older machine: cnc_rdcncid and cnc_statinfo2 are
+    // 0i-D/F and 30i only, cnc_rdpm_item starts at 16i-B, and cnc_rdcommand is
+    // absent on 16i/18i/21i. On those each costs a round trip and returns EW_FUNC.
+    // A flow that polls a mixed fleet should use the individual functions instead.
+    const machineId = await read('machine_id',       () => fnMachineId(focas));
+    const seqnum    = await read('sequence_number',  () => fnSequenceNumber(focas));
+    const modal     = await read('modal_commands',   () => fnCommand(focas, 'modal'));
+    const progmem   = await read('program_memory',   () => fnProgramMemory(focas));
+    const maint     = await read('maintenance',      () => fnMaintenance(focas));
+    const blkcount  = await read('block_count',      () => fnBlockCount(focas));
+    const calendar  = await read('calendar',         () => fnCalendar(focas));
+    const status2   = await read('machine_state_ext', () => fnStatusInfo2(focas, runModes));
 
     return {
         controller:       sysinfo,
+        machine_id:       machineId,
         machine_state:    status,
+        machine_state_ext: status2,
         active_program:   program,
+        sequence_number:  seqnum,
+        modal_commands:   modal,
+        program_memory:   progmem,
+        maintenance:      maint,
+        block_count:      blkcount,
+        calendar:         calendar,
         timers,
         part_count:       parts,
         feedrate_spindle: { actual_feedrate_mm_min: feed, actual_spindle_rpm: spindle },
@@ -550,12 +846,14 @@ async function fnAll(focas, runModes, cncSeries) {
         active_alarms:    alarms,
         alarm_status:     almstat,
         pmc_alarms:       pmcalm,
-        errors,
     };
 }
 
 // ── Main dispatcher ───────────────────────────────────────────────────────────
-async function collect(ip, port, cnc_series, fn, subtype, params) {
+// `log(key, err)` receives the reason a field could not be read. The payload carries
+// no error channel, so this is where that information goes instead — the node passes
+// its own logger, and a standalone caller can pass a no-op.
+async function collect(ip, port, cnc_series, fn, subtype, params, log = () => {}) {
     const focas    = new Focas(ip, port);
     const runModes = cnc_series === '15' ? RUN_MODES_15 : RUN_MODES_16;
 
@@ -570,7 +868,7 @@ async function collect(ip, port, cnc_series, fn, subtype, params) {
             case 'timers':         result = await fnTimers(focas);                 break;
             case 'program_number': result = await fnProgramNumber(focas);          break;
             case 'part_count':     result = await fnPartCount(focas);              break;
-            case 'tool_life':      result = await fnToolLife(focas);               break;
+            case 'tool_life':      result = await fnToolLife(focas, log);          break;
             case 'tool_offsets':   result = await fnToolOffsets(focas);            break;
             case 'alarm_messages': result = await fnAlarmMessages(focas, cnc_series); break;
             case 'alarm_status':   result = await fnAlarmStatus(focas, cnc_series);   break;
@@ -578,8 +876,21 @@ async function collect(ip, port, cnc_series, fn, subtype, params) {
             case 'axes_data':      result = await fnAxesData(focas, subtype);      break;
             case 'parameters':     result = await fnParameters(focas, params);     break;
             case 'macro':          result = await fnMacro(focas, params);          break;
+            // ── tier-1/2 reads ────────────────────────────────────────────────
+            case 'machine_id':     result = await fnMachineId(focas);              break;
+            case 'work_zero_offsets':
+                result = await fnWorkZeroOffsets(focas, parseInt(focas.sysinfo.axes, 10) || 1);
+                break;
+            case 'sequence_number': result = await fnSequenceNumber(focas);        break;
+            case 'command':        result = await fnCommand(focas, subtype);       break;
+            case 'program_memory': result = await fnProgramMemory(focas);          break;
+            case 'maintenance':    result = await fnMaintenance(focas);            break;
+            case 'block_count':    result = await fnBlockCount(focas);             break;
+            case 'calendar':       result = await fnCalendar(focas);               break;
+            case 'status_info2':   result = await fnStatusInfo2(focas, runModes); break;
+            case 'pmc_read':       result = await fnPmcRead(focas, params);        break;
             case 'all':
-            default:               result = await fnAll(focas, runModes, cnc_series); break;
+            default:               result = await fnAll(focas, runModes, cnc_series, log); break;
         }
         // Object-spreading a list-shaped result would turn it into {"0":..,"1":..},
         // so alarm_messages keeps its array and gets the timestamp as a property.
@@ -627,9 +938,18 @@ module.exports = function(RED) {
             const subtype = msg.subtype   || config.subtype || 'feedrate';
             const params  = msg.params    || config.params  || '';
 
+            // A field that could not be read becomes null in the payload; the reason
+            // goes to the Node-RED log instead. The payload carries no error channel,
+            // so this is the only place the cause survives — without it a null would
+            // be indistinguishable from "the controller said nothing".
+            const log = (key, err) => {
+                node.warn(`${fn}: ${key} could not be read — ${err && err.message || err}`);
+            };
+
             node.status({ fill:'blue', shape:'dot', text: fn });
             try {
-                msg.payload = await collect(server.host, server.port, server.cnc_series, fn, subtype, params);
+                msg.payload = await collect(server.host, server.port, server.cnc_series,
+                                            fn, subtype, params, log);
                 node.status({ fill:'green', shape:'dot', text:'ok' });
                 send(msg);
                 done();

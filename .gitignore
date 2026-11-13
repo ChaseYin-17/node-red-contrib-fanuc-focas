@@ -6,9 +6,15 @@
 # commit 0f5a6a7 and were pushed. The history was rewritten on 2026-11-13 to drop them
 # (git filter-repo --invert-paths --path docs/FANUC_Focas_API); the files stay on the
 # developer's disk and are ignored from here on. Do not remove these two lines.
+.commandcode/
+.claude/
+
+logs/
 lib/
 docs/FANUC_Focas_API/
 
 node_modules/
-.commandcode/
-.claude/
+
+# Python bytecode from tools/probe-dll-*.py
+__pycache__/
+*.pyc

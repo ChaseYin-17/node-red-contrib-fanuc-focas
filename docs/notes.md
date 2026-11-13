@@ -607,3 +607,284 @@ offsets. Capture them with `tools/probe-dll-tofs.py` before adding any of them.
 `cnc_rdzofs` is also still unimplemented: its argument packing is not settled (see above),
 so it is a probe (`tools/probe-tofs.js`) rather than a decoder.
 
+---
+
+## Tier-1/2 read set: opcodes and wire layouts
+
+Measured **2026-11-13** on the 31i at **`10.192.232.189:8193`** — `cnc_type` `31`,
+`mt_type` ` M`, series `G40A`, version `60.0`, `max_axis` 32, `axes` `"05"`.
+The machine was in MEM with `run=3` (START) and `motion=1` for part of the run, so the
+values below are live readings, not a parked controller.
+
+Two tools produced this:
+
+- `python tools/probe-dll-opcode.py --stub --tier12` — the opcodes, from the vendor
+  library's own traffic. No controller needed; the request bytes are on the wire before
+  any reply is parsed, so they are sound even though the stub's replies are synthesised.
+- `node tools/probe-tier12-layout.js` / `probe-tier12-verify.js` / `probe-pmc-byteorder.js`
+  — the response layouts, from the controller itself.
+
+Every function here was checked against its SpecE page first: **none carries
+`stop sampling` / `cnc_stopophis` / `stop logging`**, so none of them interrupts the
+CNC's own history recording. The ones that do (`cnc_rdalmhistry*`, `cnc_rdophistry*`,
+`cnc_rdalmhisno`, `cnc_rdophisno4`, `cnc_rdomhis*`) are deliberately absent.
+
+### Opcodes
+
+| call | wire func | c1/c2 | request args |
+|---|---|---|---|
+| `cnc_rdcncid`      | `0x0e8` | 1 / 1 | — |
+| `cnc_rdzofsinfo`   | `0x0d`  | 1 / 1 | — |
+| `cnc_rdzofs`       | `0x0b`  | 1 / 1 | `number`, `number`, `axis` |
+| `cnc_rdseqnum`     | `0x1d`  | 1 / 1 | — |
+| `cnc_rdcommand`    | `0x97`  | 1 / 1 | `type`, `block` |
+| `cnc_rdopmsg3`     | `0xd0`  | 1 / 1 | `0`, `type`, `1` — **not implemented, see below** |
+| `cnc_statinfo2`    | `0xe2` + `0xe1` + `0x98` | 1 / 1 | — (three sub-requests, one frame) |
+| `cnc_rdproginfo`   | `0x07`  | 1 / 1 | — |
+| `cnc_rdpm_item`    | `0xbe`  | 1 / 1 | `start`, `num` |
+| `cnc_rdblkcount`   | `0x35`  | 1 / 1 | — |
+| `cnc_gettimer`     | `0x45`  | 1 / 1 | `type` |
+| `cnc_rdexecprog`   | `0x20`  | 1 / 1 | `length`, 0, 0, 0, 0 |
+| `pmc_rdpmcrng`     | `0x8001`| **2 / 1** | `s_number`, `e_number`, `adr_type`, `data_type`, 0 |
+
+**`pmc_rdpmcrng` is 2/1, like `pmc_rdalmmsg`.** The second word of the pair is a
+path/unit selector, so sending 1/2 is answered `EW_PATH` (11) — the same trap that cost
+this project a release. Its arguments are also **not** the C order: the wire is
+`(s_number, e_number, adr_type, data_type, 0)`, and `length` never goes on the wire at
+all — the library computes it.
+
+### Three functions need no new opcode
+
+| call | what it actually sends | note |
+|---|---|---|
+| `cnc_rdalminfo`   | `0x23` | the same opcode as `cnc_rdalmmsg`; `withtext=0` is the "without message" form |
+| `cnc_rdspload`    | `0x40[0]` | the same opcode as `cnc_rdspmeter(type=0)` |
+| `cnc_rdspmaxrpm`  | `0x40[1]` | `cnc_rdspmeter(type=1)` |
+| `cnc_rdspgear`    | `0x40[2]` | **not** in `cnc_rdspmeter`'s documented 0/1/-1 enum |
+
+`cnc_rdalminfo(type=0)` puts `(-1, 25, 0, 32, 0)` on the wire, which is exactly
+`cnc_rdalmmsg(type=-1, maxmsgs=25, withtext=0, textlen=32)`. The node's
+`readalarmcode()` with `withtext=0` already reaches it.
+
+### Response layouts
+
+Every one of these widens `short` to a 4-byte long and drops the C `dummy` fields, the
+same treatment `ODBALM` and `ODBUSEGR` get. The C struct is not the wire.
+
+| call | wire bytes | layout |
+|---|---:|---|
+| `cnc_rdcncid`    | 16 | 4 × `unsigned long`, **matches the C struct** |
+| `cnc_rdzofsinfo` | 4  | one long (`307` on this machine) — not `sizeof(short)` |
+| `cnc_rdzofs`     | 8  | `value(i32) \| unit(i16) \| dec(i16)`, no header |
+| `cnc_rdseqnum`   | 4  | one long; `ODBSEQ`'s `dummy[2]` is dropped |
+| `cnc_rdcommand`  | 12·N | `adrs(u8) \| num(u8) \| flag(u16) \| cmd_val(i32) \| dec_val(i32)` |
+| `cnc_rdopmsg3`   | — | **not decoded** — the reply could not be identified, see below |
+| `cnc_statinfo2`  | 22 + 4 + 2 | sub1 = 11 shorts starting at `aut`; sub2 = `hdck`/`tmmode`; sub3 not used |
+| `cnc_rdproginfo` | 16 | **four longs**: registered, available, used_mem, unused_mem |
+| `cnc_rdpm_item`  | 80·N | `name[64] \| type(i32) \| total(i32) \| remain(i32) \| stat(i32)` — name padded 62→64 |
+| `cnc_rdblkcount` | 4  | one long |
+| `cnc_gettimer`   | 12 | **6 shorts: year, month, day, hour, minute, second** |
+| `pmc_rdpmcrng`   | N·width | raw PMC bytes, no header |
+
+#### `cnc_rdzofs` — the argument packing is settled
+
+The second slot **repeats the offset number**, the same shape `cnc_rdparam3` uses:
+
+| call | wire args |
+|---|---|
+| `cnc_rdzofs(1, axis=1)` | `1 1 1` |
+| `cnc_rdzofs(1, axis=2)` | `1 1 2` |
+| `cnc_rdzofs(2, axis=1)` | `2 2 1` |
+
+That is why the C order `(number, axis, length)` was answered `EW_ATTRIB` — the third
+slot is the axis, not a length. Measured values on this machine: offset 1 axis 1 =
+−299.015 mm, axis 2 = −199.000, axis 3 = −400.000, all at dec 3, unit 10.
+
+#### `cnc_gettimer` — date and time are two calls, and each fills only its own half
+
+The spec says date and time are separate calls selected by `type`, and the wire agrees
+— but the reply is always the full 12 bytes, and **the half that was not asked for
+keeps whatever was in the buffer**:
+
+```
+type=0 (date) → 2026 11 13 8269 18228 12353   ← tail is stale
+type=1 (time) → 2026 11 13 17 18 26           ← head is the last date read
+```
+
+So `gettimer()` reads `type=0` for the date and `type=1` for the time and takes each
+half from the call that asked for it. **Reading one type twice does not work** — the
+unasked half is never filled. An earlier version of this note said one call returned
+both; that was wrong, and the first end-to-end run against the controller caught it
+(the hour came back as 8269).
+
+#### `cnc_rdopmsg3` — NOT implemented, because the reply could not be identified
+
+The opcode `0xd0` was captured, but on the 31i at 10.192.232.189 the reply is not an
+`OPMSG3` at all: 268 bytes whose content is the `cnc_sysinfo` block (`G40A`, `60.0`,
+`05` — that machine's series, version and axis count) followed by zeros, **identical
+across every `type` and every call**. That is the signature this file records for a
+wrong opcode — an answer that does not change with its arguments — and the machine had
+no operator message set, so the real layout could not be measured either way.
+
+There is no decoder for it. Do not add one until a controller with a message typed on
+screen can be probed.
+
+#### `cnc_statinfo2` — sub1 starts at `aut`, and sub3 is not part of ODBST2
+
+One frame carries `0xe2`, `0xe1` and `0x98`. The assembly is **not** `sub1 + sub2` in
+`ODBST2` declaration order. Measured 2026-11-13 on the 31i at 10.192.232.189, back to
+back with the plain `cnc_statinfo`:
+
+```
+cnc_statinfo (0x19) : 1 3 1 0 0 0 0            (aut run motion mstb emergency alarm edit)
+statinfo2 sub1 (e2) : 1 3 1 0 0 0 0 0 0 0 0    (11 shorts)
+statinfo2 sub2 (e1) : 0 3                      (2 shorts)
+```
+
+sub1's first seven shorts are **byte-identical** to `cnc_statinfo`'s seven, so **sub1
+starts at `aut`** — not at `hdck`. sub2 is then `hdck`/`tmmode`, the two fields `ODBST2`
+declares first. Reading sub1 as if it began with `hdck`/`tmmode` shifts every field by
+two; an earlier version of this decoder did exactly that and reported `run=****` /
+`motion=Stopped` while the machine was in `STaRt`/`Moving`.
+
+`0x98` answers 2 bytes and is **not** part of the struct — do not request it.
+
+#### `cnc_rdproginfo` — four longs, not two shorts then two longs
+
+The wire is 16 bytes of **four longs**:
+
+```
+00 00 00 81 | 00 00 03 70 | 00 02 bd 2c | 00 7e ca fc
+    129          880           179500        8309500
+```
+
+The C `ODBNC` union's `bin` branch is `short reg_prg | short unreg_prg | long used_mem |
+long unused_mem`, and reading the wire that way gives `registered = 0` — which is wrong.
+That machine has **112 programs in its directory** and **129 registered**, so the
+four-long reading is the one that agrees with an independent count. The wire widens the
+two shorts to longs, the same treatment every other record here gets.
+
+#### `pmc_rdpmcrng` — the data_type enum is FwSymbol.h's, not the spec's
+
+`FwSymbol.h` defines `PMC_BYTE 0`, `PMC_WORD 1`, `PMC_LONG 2`. The SpecE page's prose
+says "0: Byte type, 1: Word type, 2: Long type" but the `length` formula on the same page
+is written against a different numbering, and reading `dtype=2` as a word is what made
+the first pass look contradictory. **Use 0/1/2 = byte/word/long.**
+
+`s_number` and `e_number` are **byte addresses at every width**. The element count is
+`(e − s + 1) / width`, and the reply is that many elements — so the same byte range read
+at all three widths always returns the same number of bytes.
+
+**Byte order: the byte path is little-endian within each 2-byte word.** Reading the same
+8 bytes three ways on this machine:
+
+```
+D100..D107 byte : 22 05 03 14 00 22 05 03
+D100..D107 word : 05 22 14 03 22 00 03 05
+D100..D107 long : 14 03 05 22 03 05 22 00
+```
+
+Reversing each 2-byte group of the byte read reproduces the word read exactly, and the
+same holds on the K area (`K0..K7`), so it is not a D-table quirk. Confirmed directly:
+`D100` as a word is `0x0522`, and `D100`/`D101` as bytes are `0x22`/`0x05` — **D100 holds
+the low half**. The long read is the word read's bytes taken 4 at a time, so it inherits
+the same order.
+
+**Bit reads return one byte per bit** (8 bits → 8 bytes), not one byte holding eight
+bits. The caller masks.
+
+#### `cnc_rdpm_item` — the name is padded to 64
+
+`IODBPMAINTE` declares `char name[62]`, but the wire stride is **80**, not 78: the name
+occupies 64 bytes. Confirmed by asking for 1, 2, 3 and 10 items — the reply is exactly
+`80·N` every time, and records 0 and 1 are byte-identical on this machine (no maintenance
+items configured), which is what a correct stride looks like when the data is uniform.
+
+#### `cnc_rdcommand` — the modal block is the useful one
+
+`type=-1` (all modal) answers 14 records of 12 bytes; `type=-2` (all commanded) answers 3
+on this machine. The modal block carries `D`(27) `E`(0) `F`(5000) `H`(23) `L`(0)
+`M1`(8) `N`(20) `O`(8002) `S`(1400) `T`(13) plus four empty `M2..M5` slots. `flag` bit
+`0x0800` is set on every populated record and clear on the empty ones — **use it to tell
+"no command" from "command is zero"**, which is the distinction the node's payload
+contract requires.
+
+### `cnc_rdexecprog` — opcode captured, pointer behaviour NOT verified
+
+`0x20`, args `(length, 0, 0, 0, 0)`. Its spec page says the execution pointer moves to
+the next block under single-block operation. The machine was cutting (`run=3`,
+`motion=1`, feed 5000 mm/min, spindle 1399 rpm) when this was measured, so **the
+pointer check was not run** — it needs an idle machine that can be watched.
+
+It is therefore **not** in `probe-funcsupport.js`'s default set. Pass
+`--include-execprog` to add it, and only against a controller that is not cutting.
+
+Under `--stub` it faults inside the DLL (access violation, not a Python exception, so it
+cannot be caught): the stub answers an empty success and the handler writes `*length`
+bytes from a reply it expects to be non-empty. `probe-dll-opcode.py` skips it in stub
+mode for that reason.
+
+### Series support — several of these are HSSB-only or absent on older CNCs
+
+From each function's `<support>` table (`O` = both, `E` = Ethernet only, `H` = HSSB only,
+`X` = cannot be used). This project is Ethernet, so **`H` and `X` both mean "not on this
+machine"**:
+
+| call | 15 | 15i | 16/18/21 | 16i/18i/21i-B | 0i-D/F | 30i-A/B |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| `pmc_rdpmcrng` | H | O | H | O | O | O |
+| `cnc_rdcncid` | X | X | X | X | O | O |
+| `cnc_rdzofs` / `cnc_rdzofsinfo` | H | O | H | O | O | O |
+| `cnc_rdseqnum` | H | O | H | O | O | O |
+| `cnc_rdcommand` | X | O | X | X | O | O |
+| `cnc_rdopmsg3` | H | O | X | O | O | O |
+| `cnc_statinfo2` | X | X | X | X | O | O |
+| `cnc_rdproginfo` | H | O | H | O | O | O |
+| `cnc_rdpm_item` | X | X | X | O | O | O |
+| `cnc_rdalminfo` | H | O | H | O | O | O |
+| `cnc_rdspgear` / `rdspload` / `rdspmaxrpm` | H | O | H | O | O | O |
+| `cnc_rdblkcount` | H | O | H | O | O | O |
+| `cnc_gettimer` | H | O | H | O | O | O |
+
+`cnc_rdcommand` additionally says "use `cnc_modal` instead" for 15, 16i/18i/21i,
+0i-A/B/C and Power Mate i — a different struct and a different type enum, so it is a
+separate decoder, not a fallback.
+
+**Do not put these in `All Data`'s mandatory path.** On an older machine each one costs a
+round trip and returns `EW_FUNC` (1) or `EW_NODLL` (-15); the node's `read()` helper
+already degrades that to `null` plus an `errors[key]` entry, which is the right contract,
+but a per-poll error on every old machine is noise.
+
+### What was verified on 10.192.232.189
+
+`node tools/probe-funcsupport.js 10.192.232.189 8193` — 46 probes, **45 `EW_OK`**, 0
+`EW_NOOPT`, 1 other. The one non-OK is `cnc_rdparam` (`0x0e`), which is the 16/18/21i
+form of `cnc_rdparam3` and is *expected* to answer `EW_FUNC` on a 30i; the node only
+tries it when `0x8d` comes back empty.
+
+All 12 new functions answered `EW_OK` on this machine. That is one 31i, not a support
+matrix — the table above is the vendor's, and the older series were not tested.
+
+### Two decode faults a captured log caught
+
+`logs/20261113-log.json` (an `All Data` poll of this machine) showed two fields that did
+not match the machine, even though `errors` was empty — which is exactly the failure mode
+the payload contract is meant to prevent: a wrong decode is not an error, it is a
+plausible-looking number.
+
+| field | logged | correct | cause |
+|---|---|---|---|
+| `program_memory.registered_programs` | `0` | `129` | the block is four longs; it was read as two shorts then two longs |
+| `machine_state_ext.run_state` / `.motion` | `****` / `Stopped` | `STaRt` / `Moving` | sub1 starts at `aut`; it was read as if it began with `hdck`/`tmmode` |
+
+Both were found by comparing against an independent read — the program directory for the
+first, `cnc_statinfo` for the second — not by looking at the numbers. `tools/probe-log-audit.js`
+reproduces the comparison, and `tools/verify-node-tier12.js` now asserts that
+`status_info2` and `status_info` agree on every field they share.
+
+**A third field looked wrong and was not.** `calendar` reported 17:35 while the poll
+timestamp was 15:22 local. That is a real **133-minute offset in the CNC's own clock**, not
+a decode fault: the hour is plausible, and a wrong `type` would have produced a nonsense
+value like `8269` (which is what the earlier one-call version did). The CNC clock is a
+machine setting; the node reports it as-is and does not correct it.
+

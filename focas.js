@@ -131,6 +131,71 @@ const TOFS_TYPES_T = {
 // of guessing a controller's capacity; see readgrpinfo4() and docs/notes.md.
 const TOOL_GROUP_PAGE = 64;
 
+// ── Tier-1/2 read function codes ──────────────────────────────────────────────
+// Captured 2026-11-13 with `python tools/probe-dll-opcode.py --stub --tier12` — the
+// vendor library's own traffic, no controller needed. The response layouts were then
+// pinned against the 31i at 10.192.232.189 with tools/probe-tier12-layout.js and
+// tools/probe-tier12-verify.js. See docs/notes.md.
+//
+// None of these pauses CNC-side history sampling: their SpecE pages carry no
+// `stop sampling` / `cnc_stopophis` / `stop logging`. The functions that DO
+// (cnc_rdalmhistry*, cnc_rdophistry*, cnc_rdalmhisno, cnc_rdophisno4, cnc_rdomhis*)
+// are deliberately absent from this file.
+//
+// cnc_rdexecprog (0x20) is also absent. Its opcode is captured, but its spec page says
+// the execution pointer moves to the next block under single-block operation and that
+// has not been disproved on a machine that could be watched. Do not add it without
+// that check — see docs/notes.md.
+const FN_RDCNCID    = 0x0e8;   // cnc_rdcncid    — machine identity
+const FN_RDZOFSINFO = 0x0d;    // cnc_rdzofsinfo — work-zero offset count
+const FN_RDZOFS     = 0x0b;    // cnc_rdzofs     — one work-zero offset
+const FN_RDSEQNUM   = 0x1d;    // cnc_rdseqnum   — sequence number under execution
+const FN_RDCOMMAND  = 0x97;    // cnc_rdcommand  — modal / commanded F,S,T,B
+const FN_RDPROGINFO = 0x07;    // cnc_rdproginfo — program memory
+const FN_RDPM_ITEM  = 0xbe;    // cnc_rdpm_item  — maintenance items
+const FN_RDBLKCOUNT = 0x35;    // cnc_rdblkcount — block counter
+const FN_GETTIMER   = 0x45;    // cnc_gettimer   — CNC calendar
+const FN_PMC_RDPMCRNG = 0x8001; // pmc_rdpmcrng — PMC data window
+
+// cnc_statinfo2 is a COMPOSITE call: the library puts three sub-requests in one frame.
+//
+// The assembly is NOT `sub1 + sub2 = ODBST2 in declaration order`. Measured 2026-11-13
+// on the 31i at 10.192.232.189, back to back with the plain cnc_statinfo:
+//
+//     cnc_statinfo (0x19) : 1 3 1 0 0 0 0            (aut run motion mstb emergency alarm edit)
+//     statinfo2 sub1 (e2) : 1 3 1 0 0 0 0 0 0 0 0    (11 shorts)
+//     statinfo2 sub2 (e1) : 0 3                      (2 shorts)
+//
+// sub1's first seven shorts are byte-identical to cnc_statinfo's seven, so **sub1
+// starts at `aut`** — not at `hdck`. sub2 is then `hdck`/`tmmode`, which ODBST2 puts
+// FIRST in its declaration. Reading sub1 as if it began with hdck/tmmode shifts every
+// field by two, which is what made an earlier version report run=**** / motion=Stopped
+// while the machine was in STaRt/Moving.
+//
+// 0x98 answers 2 bytes and is NOT part of the struct — do not request it.
+const FN_STATINFO2_A = 0x0e2;
+const FN_STATINFO2_B = 0x0e1;
+
+// pmc_rdpmcrng's command pair is 2/1, like pmc_rdalmmsg — the second word is a
+// path/unit selector, so 1/2 is answered EW_PATH (11). Its arguments are also not the
+// C order: the wire is (s_number, e_number, adr_type, data_type, 0) and `length` never
+// goes on the wire at all.
+const PMC_RDPMCRNG_C1 = 2;
+const PMC_RDPMCRNG_C2 = 1;
+
+// FwSymbol.h: PMC_BYTE 0, PMC_WORD 1, PMC_LONG 2. The SpecE page's prose says the same
+// thing but its length formula is written against a different numbering; reading
+// dtype=2 as a word is what made the first capture look contradictory.
+const PMC_BYTE = 0;
+const PMC_WORD = 1;
+const PMC_LONG = 2;
+const PMC_WIDTH = { [PMC_BYTE]: 1, [PMC_WORD]: 2, [PMC_LONG]: 4 };
+
+// PMC address areas, in the order pmc_rdpmcrng's adr_type numbers them.
+const PMC_AREAS = {
+    G: 0, F: 1, Y: 2, X: 3, A: 4, R: 5, T: 6, K: 7, C: 8, D: 9,
+};
+
 // ── Alarm / PMC alarm function codes ──────────────────────────────────────────
 // Captured with tools/probe-dll-opcode.py — the vendor library driven through a
 // local proxy with both directions hexdumped, which is how cnc_rdsvmeter = 0x56
@@ -296,6 +361,154 @@ function parseParamBody(data, maxaxis) {
         r[varname] = values;
     }
     return r;
+}
+
+// ── Tier-1/2 response decoders ────────────────────────────────────────────────
+// Every one of these widens `short` to a 4-byte long and drops the C `dummy` fields,
+// the same treatment ODBALM and ODBUSEGR get. The C struct is not the wire. Layouts
+// measured 2026-11-13 on the 31i at 10.192.232.189 — see docs/notes.md.
+
+// cnc_rdcommand's ODBCMD record: adrs(u8) | num(u8) | flag(u16) | cmd_val(i32) |
+// dec_val(i32) = 12 bytes, which IS the C struct. flag bit 0x0800 is set on every
+// populated record and clear on the empty M2..M5 slots, so it is what tells "no
+// command" from "command is zero".
+const ODBCMD_BYTES = 12;
+const ODBCMD_FLAG_PRESENT = 0x0800;
+
+function decodeCommand(data) {
+    const out = [];
+    for (let pos = 0; pos + ODBCMD_BYTES <= data.length; pos += ODBCMD_BYTES) {
+        const flag = data.readUInt16BE(pos + 2);
+        const val  = data.readInt32BE(pos + 4);
+        const dec  = data.readInt32BE(pos + 8);
+        out.push({
+            address: String.fromCharCode(data[pos]),
+            number:  data[pos + 1],
+            flag,
+            present: (flag & ODBCMD_FLAG_PRESENT) !== 0,
+            raw:     val,
+            dec,
+            // A dec outside 0..9 is not a decimal position; keep the raw value rather
+            // than dividing by a nonsense power of ten.
+            value:   (dec >= 0 && dec <= 9) ? val / Math.pow(10, dec) : val,
+        });
+    }
+    return out;
+}
+
+// cnc_rdpm_item's IODBPMAINTE: name[64] | type(i32) | total(i32) | remain(i32) |
+// stat(i32) = 80 bytes. The C struct declares name[62]; the wire pads it to 64, which
+// is why the stride is 80 and not 78. Confirmed by asking for 1/2/3/10 items — the
+// reply is exactly 80·N every time.
+const IODBPMAINTE_BYTES = 80;
+const IODBPMAINTE_NAME  = 64;
+
+function decodeMaintenanceItems(data) {
+    const out = [];
+    for (let pos = 0; pos + IODBPMAINTE_BYTES <= data.length; pos += IODBPMAINTE_BYTES) {
+        let name = data.slice(pos, pos + IODBPMAINTE_NAME);
+        const nul = name.indexOf(0);
+        if (nul !== -1) name = name.slice(0, nul);
+        const text = name.toString('latin1').trim();
+        out.push({
+            // An unconfigured item has an empty name. null, not '', so a caller can
+            // tell "no name set" from "a name that is blank".
+            name:   text || null,
+            type:   data.readInt32BE(pos + 64),
+            total:  data.readInt32BE(pos + 68),
+            remain: data.readInt32BE(pos + 72),
+            stat:   data.readInt32BE(pos + 76),
+        });
+    }
+    return out;
+}
+
+// cnc_gettimer answers 12 bytes of six shorts: year/month/day then hour/minute/second.
+// The spec says date and time are separate calls selected by `type`, and that is
+// exactly what the wire does — but the reply is always the full 12 bytes, and the
+// half that was NOT asked for keeps whatever was in the buffer:
+//
+//     type=0 (date) → 2026 11 13 8269 18228 12353   ← tail is stale
+//     type=1 (time) → 2026 11 13 17 18 26           ← head is the last date read
+//
+// So the two halves must be read separately and each taken from the call that asked
+// for it. Reading `type=0` twice does not help: the tail is never filled by it.
+// Measured 2026-11-13 on the 31i at 10.192.232.189.
+const IODBTIMER_BYTES = 12;
+
+function decodeTimerDate(data) {
+    if (data.length < IODBTIMER_BYTES) return null;
+    return { year: data.readInt16BE(0), month: data.readInt16BE(2), day: data.readInt16BE(4) };
+}
+
+function decodeTimerTime(data) {
+    if (data.length < IODBTIMER_BYTES) return null;
+    return { hour: data.readInt16BE(6), minute: data.readInt16BE(8), second: data.readInt16BE(10) };
+}
+
+// cnc_rdproginfo answers 16 bytes: FOUR longs, not the C ODBNC union's
+// `short reg_prg | short unreg_prg | long used_mem | long unused_mem`.
+//
+// Measured 2026-11-13 on the 31i at 10.192.232.189: `00 00 00 81 | 00 00 03 70 |
+// 00 02 bd 2c | 00 7e ca fc` = 129 | 880 | 179500 | 8309500. Read as two shorts then
+// two longs it gives registered=0, which is wrong — that machine has 112 programs in
+// its directory and 129 registered. The wire widens the two shorts to longs, the same
+// treatment every other record here gets.
+const ODBNC_BYTES = 16;
+
+function decodeProgramInfo(data) {
+    if (data.length < ODBNC_BYTES) return null;
+    return {
+        registered:  data.readInt32BE(0),
+        available:   data.readInt32BE(4),
+        used_mem:    data.readInt32BE(8),
+        unused_mem:  data.readInt32BE(12),
+    };
+}
+
+// cnc_rdopmsg3 (0xd0) is NOT implemented, and there is no decoder for it here.
+//
+// Its opcode was captured, but on the 31i at 10.192.232.189 the reply is not an
+// OPMSG3 at all: 268 bytes whose content is the cnc_sysinfo block (`G40A`, `60.0`,
+// `05` — that machine's series, version and axis count) followed by zeros, identical
+// across every `type` and every call. That is the signature docs/notes.md records for
+// a wrong opcode — an answer that does not change with its arguments — and the machine
+// had no operator message set, so the real layout could not be measured either way.
+// Do not add a decoder until a controller with a message typed on screen can be probed.
+
+// cnc_rdzofs answers the same 8-byte value(i32) | unit(i16) | dec(i16) record the tool
+// offsets use, with no header — not the IODBZOFS C struct.
+function decodeZofsRecord(data) {
+    if (data.length < 8) return null;
+    const raw  = data.readInt32BE(0);
+    const unit = data.readInt16BE(4);
+    const dec  = data.readInt16BE(6);
+    return { raw, unit, dec, value: raw / Math.pow(10, dec) };
+}
+
+// pmc_rdpmcrng answers raw PMC bytes with no header. The byte path is LITTLE-endian
+// within each 2-byte word: reading the same 8 bytes three ways on the 31i at
+// 10.192.232.189 gave
+//
+//     byte : 22 05 03 14 00 22 05 03
+//     word : 05 22 14 03 22 00 03 05
+//     long : 14 03 05 22 03 05 22 00
+//
+// and reversing each 2-byte group of the byte read reproduces the word read exactly.
+// Confirmed directly: D100 as a word is 0x0522 while D100/D101 as bytes are 0x22/0x05,
+// so D100 holds the LOW half. The same held on the K area, so it is not a D-table quirk.
+//
+// The node therefore reads PMC at BYTE width and assembles wider values here, which
+// keeps one ordering rule instead of three.
+function decodePmcBytes(data, dataType) {
+    const width = PMC_WIDTH[dataType] ?? 1;
+    const out = [];
+    for (let pos = 0; pos + width <= data.length; pos += width) {
+        if (width === 1)      out.push(data[pos]);
+        else if (width === 2) out.push(data.readUInt16LE(pos));
+        else                  out.push(data.readUInt32LE(pos));
+    }
+    return out;
 }
 
 // ── FOCAS status codes ────────────────────────────────────────────────────────
@@ -1170,6 +1383,259 @@ class Focas {
         }
         return groups;
     }
+
+    // ── Tier-1/2 reads ────────────────────────────────────────────────────────
+    // All read-only. None of them pauses CNC-side history sampling — see the
+    // function-code block near the top of this file for the audit that established
+    // that, and docs/notes.md for the measured layouts.
+
+    /**
+     * cnc_rdcncid (0x0e8) — the machine's stable identity: four unsigned longs.
+     *
+     * This is the only identifier here that survives a software upgrade, so it is
+     * what a multi-machine deployment should key on. `cnc_sysinfo`'s series/version
+     * are shared by every machine of the same model.
+     *
+     * The wire is 16 bytes and DOES match the C struct — unusual for this project.
+     */
+    async readcncid() {
+        const st = await this._reqSingle(1, 1, FN_RDCNCID);
+        if (st.error !== undefined) throw new Error(reqErr('cnc_rdcncid', st));
+        if (st.len < 16)
+            throw new Error(`cnc_rdcncid: ${st.len}-byte reply, expected 16`);
+        const id = [0, 1, 2, 3].map(i => st.data.readUInt32BE(i * 4));
+        return {
+            // Hex is the form to quote in a ticket; decimal is what the SDK returns.
+            hex:     id.map(v => v.toString(16).padStart(8, '0')).join('-'),
+            values:  id,
+        };
+    }
+
+    /**
+     * cnc_rdzofsinfo (0x0d) — how many work-zero offsets the table has.
+     *
+     * The wire answers 4 bytes (one long), not `sizeof(short)`: the same widening
+     * cnc_rdtofsinfo shows. Measured 307 on the 31i at 10.192.232.189.
+     */
+    async readzofsinfo() {
+        const st = await this._reqSingle(1, 1, FN_RDZOFSINFO);
+        if (st.error !== undefined || st.len < 4)
+            throw new Error(reqErr('cnc_rdzofsinfo', st));
+        return { use_no: st.data.readInt32BE(0) };
+    }
+
+    /**
+     * cnc_rdzofs (0x0b) — one work-zero offset value.
+     *
+     * The wire arguments are (number, number, axis): the second slot REPEATS the
+     * offset number, the same shape cnc_rdparam3 uses. Sending the C order
+     * (number, axis, length) is answered EW_ATTRIB, which is what made this look
+     * unimplementable until the capture showed the repeat.
+     *
+     * The reply is one 8-byte value(i32) | unit(i16) | dec(i16) record with no
+     * header, not the IODBZOFS C struct.
+     */
+    async readzofs(number, axis) {
+        const st = await this._reqSingle(1, 1, FN_RDZOFS, number, number, axis);
+        if (st.error !== undefined)
+            throw new Error(reqErr('cnc_rdzofs', st, `for number=${number} axis=${axis}`));
+        const rec = decodeZofsRecord(st.data || Buffer.alloc(0));
+        if (!rec)
+            throw new Error(reqErr('cnc_rdzofs', st, `for number=${number} axis=${axis}`));
+        return { number, axis, ...rec };
+    }
+
+    /**
+     * cnc_rdseqnum (0x1d) — the sequence number of the block being executed.
+     *
+     * A program with no N numbers leaves this at the last one it saw, so it is a
+     * progress hint, not an exact position. The wire is one long; ODBSEQ's
+     * `dummy[2]` is dropped.
+     */
+    async readseqnum() {
+        const st = await this._reqSingle(1, 1, FN_RDSEQNUM);
+        if (st.error !== undefined || st.len < 4)
+            throw new Error(reqErr('cnc_rdseqnum', st));
+        return st.data.readInt32BE(0);
+    }
+
+    /**
+     * cnc_rdcommand (0x97) — modal or commanded F/S/T/B.
+     *
+     * `type` -1 reads all modal data, -2 all commanded data; 0..29 and 100..129 read
+     * one item each. `block` 0/1/2 is previous/active/next.
+     *
+     * Each record carries `present`, taken from flag bit 0x0800, which is set on every
+     * populated record and clear on the empty M2..M5 slots. That is what separates
+     * "no command" from "command is zero" — the distinction the payload contract
+     * requires, and the reason this returns records rather than a flat map.
+     *
+     * Not available on Series 15, 16i/18i/21i, 0i-A/B/C or Power Mate i; those need
+     * cnc_modal, which is a different struct and a different type enum.
+     */
+    async readcommand(type = -1, block = 1) {
+        const st = await this._reqSingle(1, 1, FN_RDCOMMAND, type, block);
+        if (st.error !== undefined) throw new Error(reqErr('cnc_rdcommand', st, `for type=${type}`));
+        if (st.len <= 0) return [];
+        if (st.len % ODBCMD_BYTES !== 0)
+            throw new Error(
+                `cnc_rdcommand: ${st.len} bytes is not a whole number of ` +
+                `${ODBCMD_BYTES}-byte ODBCMD records (type=${type})`
+            );
+        return decodeCommand(st.data);
+    }
+
+    /**
+     * cnc_rdproginfo (0x07) — program memory: registered/available programs and
+     * used/unused memory.
+     *
+     * The request puts NO arguments on the wire — the type and length are
+     * library-side. The reply is 16 bytes: a 4-byte prefix then
+     * reg_prg(i16) | unreg_prg(i16) | used_mem(i32) | unused_mem(i32).
+     */
+    async readproginfo() {
+        const st = await this._reqSingle(1, 1, FN_RDPROGINFO);
+        if (st.error !== undefined) throw new Error(reqErr('cnc_rdproginfo', st));
+        const info = decodeProgramInfo(st.data || Buffer.alloc(0));
+        if (!info) throw new Error(`cnc_rdproginfo: ${st.len}-byte reply, expected ${ODBNC_BYTES}`);
+        return info;
+    }
+
+    /**
+     * cnc_rdpm_item (0xbe) — the CNC's maintenance items (1..10).
+     *
+     * Each record is name[64] | type | total | remain | stat = 80 bytes. The C struct
+     * declares name[62]; the wire pads it to 64, which is why the stride is 80.
+     *
+     * `total`/`remain` are in the unit `type` selects (0 invalid, 1 all-time, 2 power-on,
+     * …) and the interface does not return that unit, so the raw numbers are kept.
+     */
+    async readpm_item(start = 1, num = 10) {
+        const st = await this._reqSingle(1, 1, FN_RDPM_ITEM, start, num);
+        if (st.error !== undefined) throw new Error(reqErr('cnc_rdpm_item', st));
+        if (st.len <= 0) return [];
+        if (st.len % IODBPMAINTE_BYTES !== 0)
+            throw new Error(
+                `cnc_rdpm_item: ${st.len} bytes is not a whole number of ` +
+                `${IODBPMAINTE_BYTES}-byte IODBPMAINTE records`
+            );
+        return decodeMaintenanceItems(st.data);
+    }
+
+    /**
+     * cnc_rdblkcount (0x35) — the block counter.
+     *
+     * Needs the program-restarting option; without it the controller answers
+     * EW_NOOPT (6), which is "not fitted", not a fault.
+     */
+    async readblkcount() {
+        const st = await this._reqSingle(1, 1, FN_RDBLKCOUNT);
+        if (st.error !== undefined || st.len < 4)
+            throw new Error(reqErr('cnc_rdblkcount', st));
+        return st.data.readInt32BE(0);
+    }
+
+    /**
+     * cnc_gettimer (0x45) — the CNC calendar.
+     *
+     * Date and time are two calls, and each fills only its own half of the 12-byte
+     * reply; the other half keeps whatever was in the buffer. So this reads `type=0`
+     * for the date and `type=1` for the time and takes each from the call that asked
+     * for it. Reading one type twice does not work — the unasked half is never filled.
+     *
+     * The CNC clock carries no timezone. Do not label it UTC or local.
+     */
+    async gettimer() {
+        const d = await this._reqSingle(1, 1, FN_GETTIMER, 0);
+        if (d.error !== undefined) throw new Error(reqErr('cnc_gettimer', d, 'for type=0 (date)'));
+        const t = await this._reqSingle(1, 1, FN_GETTIMER, 1);
+        if (t.error !== undefined) throw new Error(reqErr('cnc_gettimer', t, 'for type=1 (time)'));
+
+        const date = decodeTimerDate(d.data || Buffer.alloc(0));
+        const time = decodeTimerTime(t.data || Buffer.alloc(0));
+        if (!date || !time)
+            throw new Error(`cnc_gettimer: ${d.len}/${t.len}-byte reply, expected ${IODBTIMER_BYTES}`);
+        return { ...date, ...time };
+    }
+
+    /**
+     * cnc_statinfo2 (0xe2 + 0xe1) — the extended run status.
+     *
+     * A COMPOSITE call: the library puts three sub-requests in one frame. **sub1
+     * starts at `aut`**, not at `hdck` — its first seven shorts are byte-identical to
+     * cnc_statinfo's seven, which is how the order was pinned. sub2 supplies
+     * `hdck`/`tmmode`, the two fields ODBST2 declares first. 0x98 is not part of the
+     * struct and is not requested.
+     *
+     * Only 0i-D/F and 30i-A/B support this; on 15/16/18/21/0i-A/B/C it is EW_FUNC.
+     */
+    async statinfo2() {
+        const a = await this._reqSingle(1, 1, FN_STATINFO2_A);
+        if (a.error !== undefined) throw new Error(reqErr('cnc_statinfo2', a, 'sub 0xe2'));
+        const b = await this._reqSingle(1, 1, FN_STATINFO2_B);
+        if (b.error !== undefined) throw new Error(reqErr('cnc_statinfo2', b, 'sub 0xe1'));
+        if (a.len < 22 || b.len < 4)
+            throw new Error(`cnc_statinfo2: ${a.len}+${b.len} bytes, expected 22+4`);
+
+        // sub1: aut run motion mstb emergency alarm edit warning o3dchk ext_opt restart
+        const w = [];
+        for (let o = 0; o + 2 <= 22; o += 2) w.push(a.data.readInt16BE(o));
+        const [aut, run, motion, mstb, emergency, alarm, edit,
+               warning, o3dchk, ext_opt, restart] = w;
+        // sub2: hdck tmmode — the two ODBST2 declares first.
+        const hdck   = b.data.readInt16BE(0);
+        const tmmode = b.data.readInt16BE(2);
+
+        return { hdck, tmmode, aut, run, motion, mstb, emergency,
+                 alarm, edit, warning, o3dchk, ext_opt, restart };
+    }
+
+    /**
+     * pmc_rdpmcrng (0x8001) — the PMC data window.
+     *
+     * The command pair is 2/1, like pmc_rdalmmsg: the second word is a path/unit
+     * selector, so 1/2 is answered EW_PATH (11) — a path error for a function with no
+     * path argument. The wire arguments are (s_number, e_number, adr_type, data_type, 0)
+     * and `length` never goes on the wire; the library computes it.
+     *
+     * `s`/`e` are BYTE addresses at every width, and the element count is
+     * (e - s + 1) / width. This always reads at BYTE width and assembles wider values
+     * in decodePmcBytes, because the byte path is little-endian within each 2-byte word
+     * and mixing widths would mean carrying three ordering rules instead of one.
+     *
+     * `area` is one of PMC_AREAS' keys (G F Y X A R T K C D). `dataType` is
+     * PMC_BYTE / PMC_WORD / PMC_LONG.
+     */
+    async readpmc(area, s, e, dataType = PMC_BYTE) {
+        const adr = PMC_AREAS[area];
+        if (adr === undefined)
+            throw new Error(`pmc_rdpmcrng: unknown area ${JSON.stringify(area)}`);
+        const width = PMC_WIDTH[dataType];
+        if (width === undefined)
+            throw new Error(`pmc_rdpmcrng: unknown data type ${dataType}`);
+        if (!Number.isInteger(s) || !Number.isInteger(e) || s < 0 || e < s)
+            throw new Error(`pmc_rdpmcrng: bad range ${s}..${e}`);
+        if ((e - s + 1) % width !== 0)
+            throw new Error(
+                `pmc_rdpmcrng: ${e - s + 1} bytes is not a whole number of ` +
+                `${width}-byte ${dataType === PMC_BYTE ? 'byte' : dataType === PMC_WORD ? 'word' : 'long'} values`
+            );
+
+        const st = await this._reqSingle(PMC_RDPMCRNG_C1, PMC_RDPMCRNG_C2,
+                                         FN_PMC_RDPMCRNG, s, e, adr, PMC_BYTE, 0);
+        // PMC calls answer with the PMC status table, not the CNC one.
+        if (st.error !== undefined) throw new Error(reqErr('pmc_rdpmcrng', st, '', PMC_ERRORS));
+        if (st.len <= 0) return [];
+        if (st.len !== e - s + 1)
+            throw new Error(
+                `pmc_rdpmcrng: ${st.len} bytes for ${e - s + 1} addresses ` +
+                `(${area}${s}..${area}${e})`
+            );
+        return decodePmcBytes(st.data, dataType);
+    }
 }
 
-module.exports = { Focas, ALLAXIS, TOOL_GROUP_PAGE, ALM_TEXT_MAX, PMC_ERRORS, FOCAS_ERRORS };
+module.exports = {
+    Focas, ALLAXIS, TOOL_GROUP_PAGE, ALM_TEXT_MAX, PMC_ERRORS, FOCAS_ERRORS,
+    PMC_AREAS, PMC_BYTE, PMC_WORD, PMC_LONG,
+};

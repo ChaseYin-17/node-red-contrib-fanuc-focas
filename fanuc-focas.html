@@ -99,6 +99,16 @@
                 alarm_status:   'Alarm Status',
                 pmc_alarms:     'PMC Alarms',
                 macro:          'Macro',
+                machine_id:     'Machine ID',
+                calendar:       'Calendar',
+                status_info2:   'Status Info (extended)',
+                program_memory: 'Program Memory',
+                sequence_number:'Sequence Number',
+                block_count:    'Block Counter',
+                command:        'Modal / Commanded F,S,T',
+                work_zero_offsets:'Work Zero Offsets',
+                maintenance:    'Maintenance Items',
+                pmc_read:       'PMC Read',
             }[this.fn] || this.fn;
             return this.name || (host ? `${host} · ${fnLabel}` : fnLabel);
         },
@@ -121,14 +131,23 @@
             function updateVisibility() {
                 const fn = $('#node-input-fn').val();
                 $('#fanuc-row-subtype').toggle(fn === 'axes_data');
-                $('#fanuc-row-params').toggle(fn === 'parameters' || fn === 'macro');
+                $('#fanuc-row-cmdblock').toggle(fn === 'command');
+                $('#fanuc-row-params').toggle(
+                    fn === 'parameters' || fn === 'macro' || fn === 'pmc_read');
                 // Update params label
                 if (fn === 'macro') {
                     $('#fanuc-params-label').text('Macro variables');
                     $('#fanuc-params-hint').text('Comma-separated macro numbers e.g. 3901,3902');
+                } else if (fn === 'pmc_read') {
+                    $('#fanuc-params-label').text('PMC addresses');
+                    $('#fanuc-params-hint').text(
+                        'Comma-separated, e.g. R0.0,D100:word,K0.0 — ' +
+                        'areas G F Y X A R T K C D; :byte / :word / :long, or .<bit> for one bit');
+                    $('#node-input-params').attr('placeholder', 'R0.0,D100:word,K0.0');
                 } else {
                     $('#fanuc-params-label').text('Parameter numbers');
                     $('#fanuc-params-hint').text('Comma-separated param numbers e.g. 6711,6712');
+                    $('#node-input-params').attr('placeholder', '6711,6712');
                 }
             }
 
@@ -137,9 +156,18 @@
             // Restore saved values
             $('#node-input-fn').val(node.fn || 'all');
             $axisType.val(node.subtype || 'feedrate');
+            $('#node-input-cmdblock').val(node.cmdblock || 'modal');
             $('#node-input-params').val(node.params || '');
 
             updateVisibility();
+        },
+
+        oneditsave: function() {
+            // `command` reuses the subtype slot for its block selector, so the two
+            // never collide: subtype is only read when fn=axes_data.
+            if ($('#node-input-fn').val() === 'command') {
+                this.subtype = $('#node-input-cmdblock').val();
+            }
         },
     });
 </script>
@@ -174,6 +202,24 @@
             <option value="pmc_alarms">PMC Alarms</option>
             <option value="macro">Macro</option>
             </optgroup>
+            <optgroup label="Identity &amp; context">
+            <option value="machine_id">Machine ID</option>
+            <option value="calendar">Calendar</option>
+            <option value="status_info2">Status Info (extended)</option>
+            <option value="program_memory">Program Memory</option>
+            <option value="sequence_number">Sequence Number</option>
+            <option value="block_count">Block Counter</option>
+            </optgroup>
+            <optgroup label="Commands &amp; messages">
+            <option value="command">Modal / Commanded F,S,T</option>
+            </optgroup>
+            <optgroup label="Offsets &amp; maintenance">
+            <option value="work_zero_offsets">Work Zero Offsets</option>
+            <option value="maintenance">Maintenance Items</option>
+            </optgroup>
+            <optgroup label="PMC">
+            <option value="pmc_read">PMC Read (address list)</option>
+            </optgroup>
         </select>
     </div>
 
@@ -181,6 +227,15 @@
     <div class="form-row" id="fanuc-row-subtype" style="display:none">
         <label for="node-input-subtype"><i class="fa fa-list"></i> Type</label>
         <select id="node-input-subtype" style="width:70%"></select>
+    </div>
+
+    <!-- Command block — shown only when fn=command -->
+    <div class="form-row" id="fanuc-row-cmdblock" style="display:none">
+        <label for="node-input-cmdblock"><i class="fa fa-list"></i> Block</label>
+        <select id="node-input-cmdblock" style="width:70%">
+            <option value="modal">Modal (what is in effect)</option>
+            <option value="commanded">Commanded (what this block asks for)</option>
+        </select>
     </div>
 
     <!-- Param / macro numbers — shown only when fn=parameters or fn=macro -->
@@ -239,6 +294,101 @@
             arrive as CNC alarms and appear under <em>Alarm Messages</em>.</dd>
         <dt>Macro</dt><dd>Custom macro variable values by number</dd>
     </dl>
+
+    <h3>Identity &amp; context</h3>
+    <dl class="message-properties">
+        <dt>Machine ID</dt><dd><code>cncid</code> — the CNC's own identity, four unsigned
+            longs as a hex string. This is the only identifier here that survives a software
+            upgrade, so a multi-machine flow should key on it rather than on
+            <code>series</code>/<code>version</code>, which every machine of the same model
+            shares. <strong>0i-D/F and 30i only.</strong></dd>
+        <dt>Calendar</dt><dd>The CNC clock: <code>year</code>, <code>month</code>,
+            <code>day</code>, <code>hour</code>, <code>minute</code>, <code>second</code>,
+            plus <code>date</code>, <code>time</code> and <code>iso_like</code> strings.
+            The CNC clock carries no timezone — it is not UTC and not necessarily local.
+            One call returns both date and time.</dd>
+        <dt>Status Info (extended)</dt><dd><code>cnc_statinfo2</code>: the same run state as
+            <em>Status Info</em> plus <code>warning</code>, <code>o3d_check</code>,
+            <code>ext_option</code> and <code>restart</code>. <strong>0i-D/F and 30i
+            only</strong> — on older series it answers <code>EW_FUNC</code>.</dd>
+        <dt>Program Memory</dt><dd><code>registered_programs</code>,
+            <code>available_programs</code>, <code>used_memory</code>,
+            <code>unused_memory</code> and <code>used_percent</code> (null when the total is
+            zero, never 0 %).</dd>
+        <dt>Sequence Number</dt><dd>The N number of the block being executed. A program with
+            no N numbers leaves this at the last one it saw, so treat it as a progress hint,
+            not an exact position.</dd>
+        <dt>Block Counter</dt><dd>The CNC's block counter. Needs the <em>program
+            restarting</em> option; without it the controller answers
+            <code>EW_NOOPT</code>.</dd>
+    </dl>
+
+    <h3>Commands &amp; messages</h3>
+    <dl class="message-properties">
+        <dt>Modal / Commanded F,S,T</dt><dd>Choose <em>Modal</em> for what is in effect or
+            <em>Commanded</em> for what the current block asks for. Returns
+            <code>commands</code> keyed by address (<code>F</code>, <code>S</code>,
+            <code>T</code>, <code>M1</code>…), each with <code>value</code>,
+            <code>raw</code> and <code>dec</code>. Only records the controller marks as
+            present are included, so a missing key means <em>no command</em> — not a zero.
+            <strong>Not available on 16i/18i/21i</strong>; those need <code>cnc_modal</code>,
+            which this node does not implement.</dd>
+    </dl>
+
+    <h3>Offsets &amp; maintenance</h3>
+    <dl class="message-properties">
+        <dt>Work Zero Offsets</dt><dd><code>use_no</code> and one entry per offset number,
+            each with a value per axis (<code>value</code>, <code>raw</code>,
+            <code>dec</code>, <code>unit</code>). <strong>Read-only</strong> — the node has
+            no write path for offsets. An axis the table does not have is null, not zero.</dd>
+        <dt>Maintenance Items</dt><dd>The CNC's maintenance items 1–10: <code>name</code>,
+            <code>type</code>, <code>total</code>, <code>remain</code>, <code>stat</code> and
+            <code>remain_percent</code> (null when <code>total</code> is zero). The unit
+            follows <code>type</code> and the interface does not return it, so the raw
+            numbers are kept.</dd>
+    </dl>
+
+    <h3>PMC Read</h3>
+    <p>Reads machine-builder signals straight out of the PMC — door interlocks, clamps,
+       cycle-complete, counters, whatever the ladder exposes. The address map belongs to the
+       machine builder, so nothing here interprets the values.</p>
+    <p>Give a comma-separated list of addresses, up to 128:</p>
+    <pre>R0.0            one bit of R0
+R0              R0 as a byte
+D100:word       D100 as a 16-bit word
+D100:long       D100 as a 32-bit long
+K0.0            one bit of K0</pre>
+    <p>Areas: <code>G F Y X A R T K C D</code>. Each result carries
+       <code>spec</code>, <code>area</code>, <code>address</code>, <code>value</code> and
+       either <code>bit</code> or <code>type</code>+<code>hex</code>.</p>
+    <p><strong>Read-only.</strong> There is no PMC write path in this node.</p>
+
+    <h3>Series support</h3>
+    <p>The identity and context functions are not on every series. From each function's
+       vendor support table, and this node is Ethernet-only — so "HSSB only" and "cannot be
+       used" both mean <em>not on this machine</em>:</p>
+    <table>
+      <tr><th>Function</th><th>Available on</th></tr>
+      <tr><td>Machine ID, Status Info (extended)</td><td>0i-D/F, 30i</td></tr>
+      <tr><td>Maintenance Items</td><td>16i-B and later</td></tr>
+      <tr><td>Modal / Commanded F,S,T</td><td>15i, 0i-D/F, 30i (not 16i/18i/21i)</td></tr>
+      <tr><td>Everything else here</td><td>15i and later, but HSSB-only on the non-i series</td></tr>
+    </table>
+    <p>A function the series does not have answers <code>EW_FUNC</code> or
+       <code>EW_NODLL</code>. In <em>All Data</em> that becomes a <code>null</code> field and
+       the reason is written to the Node-RED log as a warning, so it never blanks the rest of
+       the snapshot — but on an older machine it costs a round trip per poll. Use the
+       individual functions for a mixed fleet.</p>
+
+    <h3>Failures</h3>
+    <p>The payload carries <strong>no error channel</strong> — it is pure data, so it can be
+       mapped straight onto OPC UA, MQTT or a database. A field that could not be read is
+       <code>null</code>, and the reason appears in the Node-RED log as a warning.</p>
+    <p><code>null</code> means <em>not read</em>; <code>[]</code> means <em>read cleanly, found
+       nothing</em>; a number means the controller reported that number. The three are
+       deliberately distinguishable.</p>
+    <p>The single-value Functions raise instead, so poll one of those if you want a failure to
+       surface as a node error.</p>
 
     <h3>Dynamic override</h3>
     <p>Set <code>msg.function</code>, <code>msg.subtype</code>, or <code>msg.params</code> to override the configured values at runtime.</p>

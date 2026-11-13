@@ -58,11 +58,31 @@ const stubs = {
     readalarmstatus2:    async () => ({ status: 0x82, bits: [1, 7] }),
     readpmcalarm:        async () => ({ alarms: [{ message: 'ER30 Battery Alarm' }],
                                         read_num: 1, exist: 0, more: false }),
+
+    // The tier-1/2 fields All Data carries. A clean run must leave `errors` empty,
+    // so every one of them needs a stub here — a new field with no stub fails that
+    // check, which is the point: it is the reminder to add the stub alongside the
+    // reader. See CLAUDE.md, "Payload contract".
+    readcncid:           async () => ({ hex: '00000001-00000002-00000003-00000004',
+                                        values: [1, 2, 3, 4] }),
+    readseqnum:          async () => 20,
+    readcommand:         async () => [],
+    readproginfo:        async () => ({ registered: 0, available: 0, used_mem: 0, unused_mem: 0 }),
+    readpm_item:         async () => [],
+    readblkcount:        async () => 0,
+    gettimer:            async () => ({ year: 2026, month: 11, day: 13,
+                                        hour: 16, minute: 56, second: 35 }),
+    statinfo2:           async () => ({ hdck: 0, tmmode: 0, aut: 1, run: 3, motion: 0,
+                                        mstb: 0, emergency: 0, alarm: 0, edit: 0,
+                                        warning: 0, o3dchk: 0, ext_opt: 0, restart: 0 }),
 };
 const applyStubs = () => Object.assign(Focas.prototype, stubs);
 applyStubs();
 
 // ── The node, hosted in a minimal Node-RED ────────────────────────────────────
+// `warnings` collects node.warn() calls: the payload has no error channel, so a field
+// that could not be read is reported there instead.
+const warnings = [];
 const configNode = { host: '127.0.0.1', port: 8193, cnc_series: '16', label: () => 'stub' };
 let pollNode = null;
 const RED = {
@@ -71,6 +91,7 @@ const RED = {
             node.on     = (ev, cb) => { node._handlers = Object.assign(node._handlers || {}, { [ev]: cb }); return node; };
             node.status = () => {};
             node.error  = (m) => { node._error = m; };
+            node.warn   = (m) => { warnings.push(m); };
             return node;
         },
         registerType(type, ctor) {
@@ -95,7 +116,8 @@ const poll = (fn) => new Promise((resolve, reject) => {
     check('pmc_alarms is its own key',
           JSON.stringify(p.pmc_alarms) === JSON.stringify([{ message: 'ER30 Battery Alarm' }]),
           JSON.stringify(p.pmc_alarms));
-    check('a clean run leaves errors empty', JSON.stringify(p.errors) === '{}', JSON.stringify(p.errors));
+    check('the payload carries no error channel',
+          !('errors' in p), Object.keys(p).join(','));
 
     h('CASE 2 — the bit labels come from the controller, not the configured series');
     // cnc_type 31 -> the 30i table: bit 1 is PW and bit 7 is SR. The 15i table would
@@ -154,10 +176,13 @@ const poll = (fn) => new Promise((resolve, reject) => {
     stubs.readalarmstatus2 = async () => { throw new Error('cnc_alarm2: CNC returned EW_NOOPT (6)'); };
     stubs.readpmcalarm = async () => ({ alarms: [{ message: 'ER01' }], read_num: 1, exist: 0, more: false });
     applyStubs();
+    warnings.length = 0;
     p = await poll('all');
     check('alarm_status is null, not {}', p.alarm_status === null, JSON.stringify(p.alarm_status));
-    check('the reason is recorded against its own key',
-          p.errors.alarm_status === 'cnc_alarm2: CNC returned EW_NOOPT (6)', JSON.stringify(p.errors));
+    check('the reason goes to the node log, not the payload',
+          warnings.some(w => /alarm_status/.test(w) && /EW_NOOPT/.test(w)),
+          JSON.stringify(warnings));
+    check('the payload still carries no error channel', !('errors' in p), Object.keys(p).join(','));
     check('active_alarms is untouched by it', Array.isArray(p.active_alarms));
     check('pmc_alarms still came through',
           JSON.stringify(p.pmc_alarms) === JSON.stringify([{ message: 'ER01' }]),

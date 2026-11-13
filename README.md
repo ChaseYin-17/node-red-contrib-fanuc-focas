@@ -67,7 +67,7 @@ npm install node-red-contrib-fanuc-focas
 
 | Function | Description | `msg.payload` fields |
 |----------|-------------|----------------------|
-| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `axes_data`, `tool_life`, `tool_offsets`, `active_alarms`, `alarm_status`, `pmc_alarms`, `errors` |
+| **All Data** | Full combined snapshot | `controller`, `machine_id`, `machine_state`, `machine_state_ext`, `active_program`, `sequence_number`, `modal_commands`, `program_memory`, `maintenance`, `block_count`, `calendar`, `timers`, `part_count`, `feedrate_spindle`, `axes_data`, `tool_life`, `tool_offsets`, `active_alarms`, `alarm_status`, `pmc_alarms` |
 | **Status Info** | Machine run state | `mode`, `run_state`, `motion`, `mstb`, `emergency`, `alarm`, `edit` |
 | **System Info** | Controller identity | `cnc_type`, `mt_type`, `series`, `version`, `axes`, `max_axes` |
 
@@ -85,6 +85,16 @@ npm install node-red-contrib-fanuc-focas
 | **Alarm Status** | Alarm status word | `status`, `bits[]` of `{ bit, label }` |
 | **PMC Alarms** | PMC's own ERxx/WNxx messages | Array of `{ message }` |
 | **Macro** | Custom macro variables | `{ [macro_number]: value, … }` |
+| **Machine ID** | The CNC's own identity | `cncid`, `cncid_values` |
+| **Calendar** | The CNC clock | `year`, `month`, `day`, `hour`, `minute`, `second`, `date`, `time`, `iso_like` |
+| **Status Info (extended)** | Run state plus warning / 3D check / restart | `mode`, `run_state`, `motion`, `mstb`, `emergency`, `alarm`, `edit`, `warning`, `o3d_check`, `ext_option`, `restart`, … |
+| **Program Memory** | Program count and memory use | `registered_programs`, `available_programs`, `used_memory`, `unused_memory`, `used_percent` |
+| **Sequence Number** | The N number being executed | `sequence_number` |
+| **Block Counter** | The CNC's block counter | `block_count` |
+| **Modal / Commanded F,S,T** | What is in effect, or what this block asks for | `block`, `commands` |
+| **Work Zero Offsets** | The work-zero offset table (read-only) | `use_no`, `axis_count`, `offsets[]` |
+| **Maintenance Items** | The CNC's maintenance items 1–10 | `items[]` |
+| **PMC Read** | Machine-builder signals from the PMC | `values[]` |
 
 ### Axes Data sub-types
 
@@ -354,6 +364,197 @@ every offset's value per type.
 > Needs the CNC's tool compensation option; without it the controller answers `EW_NOOPT`
 > and the field is `null` with the reason in `errors`.
 
+### Machine ID
+
+```json
+{
+  "cncid": "3c7b5d01-56818a9a-be282789-6462c4fd",
+  "cncid_values": [1014717697, 1451330202, 3190302601, 1684194557]
+}
+```
+
+The CNC's own identity, read with `cnc_rdcncid`. This is the only identifier here that
+survives a software upgrade, so a multi-machine flow should key on it rather than on
+`series`/`version` — those are shared by every machine of the same model.
+
+> **0i-D/F and 30i only.** On older series the controller answers `EW_FUNC` and the
+> field is `null` with the reason in `errors`.
+
+### Calendar
+
+```json
+{
+  "year": 2026, "month": 11, "day": 13,
+  "hour": 17, "minute": 18, "second": 26,
+  "date": "2026-11-13", "time": "17:18:26",
+  "iso_like": "2026-11-13T17:18:26"
+}
+```
+
+Read with `cnc_gettimer`. Date and time are **two calls** — each fills only its own half
+of the 12-byte reply, and the half that was not asked for keeps whatever was in the
+buffer, so the node reads both and takes each from the call that asked for it.
+
+> The CNC clock carries **no timezone**. `iso_like` has no `Z` and no offset on purpose:
+> it is not UTC and not necessarily local time. Do not label it as either.
+
+### Status Info (extended)
+
+`cnc_statinfo2` — the same run state as **Status Info** plus `warning`, `o3d_check`,
+`ext_option` and `restart`. The fields `cnc_statinfo` also reports (`mode`, `run_state`,
+`motion`, `mstb`, `emergency`, `alarm`, `edit`) are labelled with the **same tables**, so
+a flow can read either function and get the same strings. The four extra fields are raw:
+their enums differ per series and nothing here interprets them.
+
+> The reply is three sub-requests in one frame, and the assembly is not the C struct's
+> field order: the first block starts at `aut`, and `hdck`/`tmmode` arrive in the second.
+> Reading it in declaration order shifts every field by two and reports `run_state: "****"`
+> on a machine that is running.
+
+> **0i-D/F and 30i only.** On older series it answers `EW_FUNC`.
+
+### Program Memory
+
+```json
+{
+  "registered_programs": 0,
+  "available_programs": 880,
+  "used_memory": 179500,
+  "unused_memory": 8309500,
+  "used_percent": 2.1
+}
+```
+
+`used_percent` is `null` when the total is zero — never `0 %`, which would read as
+"empty" rather than "unknown".
+
+> The wire is **four longs** — registered, available, used memory, unused memory — not the
+> C `ODBNC` union's two shorts then two longs. Reading it the C way reports
+> `registered_programs: 0` on a machine with 129 programs registered.
+
+### Sequence Number and Block Counter
+
+`sequence_number` is the N number of the block being executed. A program with no N
+numbers leaves it at the last one it saw, so treat it as a progress hint, not an exact
+position.
+
+`block_count` needs the **program restarting** option; without it the controller answers
+`EW_NOOPT` and the field is `null`.
+
+### Modal / Commanded F,S,T
+
+```json
+{
+  "block": "modal",
+  "commands": {
+    "F": { "value": 5000, "raw": 5000, "dec": 0, "address": "F", "number": 0 },
+    "S": { "value": 1400, "raw": 1400, "dec": 0, "address": "S", "number": 0 },
+    "T": { "value": 13,   "raw": 13,   "dec": 0, "address": "T", "number": 0 },
+    "M1": { "value": 8,   "raw": 8,    "dec": 0, "address": "M", "number": 1 }
+  }
+}
+```
+
+Choose **Modal** for what is in effect or **Commanded** for what the current block asks
+for. Only records the controller marks as present are included, so **a missing key means
+"no command", not "zero"** — the distinction the rest of the payload keeps.
+
+> **Not available on 16i/18i/21i.** Those need `cnc_modal`, which is a different struct
+> and a different type enum; this node does not implement it.
+
+### Work Zero Offsets
+
+```json
+{
+  "use_no": 307,
+  "axis_count": 5,
+  "offsets": [
+    { "number": 1, "values": {
+        "1": { "value": -299.015, "raw": -299015, "dec": 3, "unit": 10 },
+        "2": { "value": -199,     "raw": -199000, "dec": 3, "unit": 10 }
+    } }
+  ]
+}
+```
+
+Read with `cnc_rdzofs`. **Read-only** — the node has no write path for offsets. An axis
+the table does not have is `null`, not zero.
+
+> The wire arguments are `(number, number, axis)`: the second slot **repeats** the offset
+> number. Sending the C order `(number, axis, length)` is answered `EW_ATTRIB`, which is
+> what made this look unimplementable until the capture showed the repeat.
+
+### Maintenance Items
+
+```json
+{
+  "items": [
+    { "index": 1, "name": "Spindle oil", "type": 1,
+      "total": 1000, "remain": 250, "stat": 0, "remain_percent": 25 }
+  ]
+}
+```
+
+The CNC's maintenance items 1–10. `total`/`remain` are in whatever unit `type` selects
+and the interface does not return that unit, so the raw numbers are kept.
+`remain_percent` is `null` when `total` is zero.
+
+### PMC Read
+
+Reads machine-builder signals straight out of the PMC — door interlocks, clamps,
+cycle-complete, counters, whatever the ladder exposes. The address map belongs to the
+machine builder, so nothing here interprets the values.
+
+Give a comma-separated list of addresses (up to 128):
+
+```
+R0.0            one bit of R0
+R0              R0 as a byte
+D100:word       D100 as a 16-bit word
+D100:long       D100 as a 32-bit long
+K0.0            one bit of K0
+```
+
+Areas: `G F Y X A R T K C D`.
+
+```json
+{
+  "values": [
+    { "spec": "R0.0", "area": "R", "address": 0, "bit": 0, "value": 0, "byte": 20 },
+    { "spec": "D100:word", "area": "D", "address": 100, "bit": null,
+      "type": "word", "value": 1314, "hex": "0x0522" }
+  ]
+}
+```
+
+> **Read-only.** There is no PMC write path in this node.
+>
+> The byte path is **little-endian within each 2-byte word**: reading the same 8 bytes
+> three ways on a 31i gave `22 05 03 14 …` as bytes, `05 22 14 03 …` as words and
+> `14 03 05 22 …` as longs. The node reads at byte width and assembles wider values
+> itself, so there is one ordering rule rather than three.
+>
+> The command pair is **2/1**, not 1/1 — the second word is a path/unit selector, and
+> sending 1/2 is answered `EW_PATH` for a function that has no path argument.
+
+### Series support
+
+The identity and context functions are not on every series. From each function's vendor
+support table — and this node is Ethernet-only, so "HSSB only" and "cannot be used" both
+mean *not on this machine*:
+
+| Function | Available on |
+|---|---|
+| Machine ID, Status Info (extended) | 0i-D/F, 30i |
+| Maintenance Items | 16i-B and later |
+| Modal / Commanded F,S,T | 15i, 0i-D/F, 30i (not 16i/18i/21i) |
+| Everything else here | 15i and later, but HSSB-only on the non-i series |
+
+A function the series does not have answers `EW_FUNC` or `EW_NODLL`. In `All Data` that
+becomes a `null` field plus an `errors` entry, so it never blanks the rest of the
+snapshot — but on an older machine it costs a round trip per poll. Use the individual
+functions for a mixed fleet.
+
 ### Partial failures — All Data
 
 `All Data` reads every field independently, so one failing function degrades **only that field**
@@ -361,34 +562,30 @@ instead of blanking the whole snapshot:
 
 ```json
 {
-  "machine_state": { "mode": "MEMory", "run_state": "****", "alarm": "ALARM", "...": "..." },
+  "machine_state": { "mode": "MEMory", "run_state": "STaRt", "alarm": null, "...": "..." },
   "active_alarms": null,
-  "errors": {
-    "active_alarms": "cnc_rdalmmsg: CNC returned EW_NOOPT (6) for type=-1"
-  },
   "timestamp": "2026-05-28T07:35:23.213Z"
 }
 ```
 
-The rules:
+The payload carries **no error channel** — it is pure data, so it can be mapped straight onto
+OPC UA, MQTT or a database without filtering out a diagnostic key. The rules:
 
-- A field that could not be read is **`null`**, and the reason appears in `errors` under the
-  same key (the field name, or `actual_feedrate_mm_min` / `actual_spindle_rpm` for the two
-  feedrate-spindle values).
+- A field that could not be read is **`null`**. The reason is written to the **Node-RED log**
+  as a warning (`all: active_alarms could not be read — cnc_rdalmmsg: CNC returned EW_NOOPT (6)`),
+  so it is still recoverable from the log without polluting the payload.
+- `null` means **not read**; `[]` means **read cleanly, found nothing**; a number means the
+  controller reported that number. The three are deliberately distinguishable.
 - `axes_data` and `tool_life` are each **one field**: every sub-read they make is part of the
-  same key, so a single failure degrades the whole block to `null` with one `errors` entry.
-  On a machine without the tool-life option that is how `tool_life` reads —
-  `null` plus `"tool_life": "cnc_rdgrpinfo4: CNC returned EW_NOOPT (6)"`.
+  same key, so a single failure degrades the whole block to `null`. On a machine without the
+  tool-life option that is how `tool_life` reads.
 - `tool_offsets` is one field too, and degrades the same way — on a machine without the
-  tool-compensation option it is `null` with `"tool_offsets": "cnc_rdtofsinfo: CNC returned
-  EW_NOOPT (6)"`.
-- `errors` is `{}` when every field read cleanly.
+  tool-compensation option it is `null`.
 - `active_alarms` is **`null` when the alarm read failed** and **`[]` when the controller
-  answered but has no active alarms** — the two are deliberately distinguishable.
+  answered but has no active alarms**.
 - The three alarm fields are **three independent reads** (`cnc_rdalmmsg`, `cnc_alarm2`,
   `pmc_rdalmmsg`), so one can fail, or be empty, while the others are fine — a PMC fault does
-  not blank the NC messages and vice versa. `null` means that read failed; `[]` (or
-  `bits: []`) means it answered and found nothing.
+  not blank the NC messages and vice versa.
 - Only the other **Functions** (single-value polls) raise. If you want a failure to be visible
   as a node error rather than a degraded payload, poll `Alarm Messages` on its own.
 
@@ -484,7 +681,6 @@ The rules:
   "active_alarms": [],
   "alarm_status": { "status": 0, "bits": [] },
   "pmc_alarms": [],
-  "errors": {},
   "timestamp": "2026-05-28T07:35:23.213Z"
 }
 ```
@@ -506,7 +702,6 @@ With an alarm present, `active_alarms` fills in:
     "bits": [ { "bit": 0, "label": "Parameter switch on (SW)" } ]
   },
   "pmc_alarms": [],
-  "errors": {},
   "timestamp": "2026-05-28T07:35:23.213Z"
 }
 ```
@@ -591,6 +786,8 @@ No additional npm dependencies — uses only Node.js built-ins (`net`, `Buffer`)
 - The tool-life function codes were read off the vendor library the same way — `0x48` `cnc_rdusegrpid`, `0x4a` `cnc_rdngrp`, `0x1c1` `cnc_rdgrpinfo4`, `0x1c4` `cnc_rdtlinfo`. The wire offsets were then pinned against a controller with the option on (see [`docs/notes.md`](docs/notes.md)). `tools/verify-node-toollife-offline.js` guards the decode, the record model and the paging loop with **no hardware** (36 checks); `tools/verify-node-toollife.js` checks it end to end against a real controller.
 - FOCAS errors are surfaced, not swallowed: a request that the CNC rejects raises (e.g. `cnc_rdalmmsg: CNC returned EW_ATTRIB (4)`). An empty array from `readalarmcode()` therefore means *no alarms*, nothing else.
 - Measured limits of the controllers this has been run against, and the changes deliberately put off for now, are kept in [`docs/notes.md`](docs/notes.md).
+- **The tier-1/2 reads were captured the same way.** `python tools/probe-dll-opcode.py --stub --tier12` puts the vendor library's requests on the wire with no controller attached, which is how `cnc_rdcncid` = `0x0e8`, `cnc_rdcommand` = `0x97`, `cnc_gettimer` = `0x45` and `pmc_rdpmcrng` = `0x8001` (pair **2/1**) were read off. The response layouts were then pinned against the 31i at `10.192.232.189` with `tools/probe-tier12-layout.js`, `tools/probe-tier12-verify.js` and `tools/probe-pmc-byteorder.js`. `tools/verify-tier12-offline.js` guards every decoder with those captured bytes and needs no hardware; `tools/verify-node-tier12.js` checks the same reads end to end against a real controller.
+- **Two reads were deliberately left out.** `cnc_rdexecprog` (`0x20`) has its opcode captured but its spec page says the execution pointer moves to the next block under single-block operation, and that has not been disproved on a machine that could be watched — so it is not implemented. `cnc_rdopmsg3` (`0xd0`) answered the `cnc_sysinfo` block on every call regardless of its arguments, which is the signature of a wrong opcode, so it has no decoder either. Both are written up in [`docs/notes.md`](docs/notes.md).
 
 ---
 

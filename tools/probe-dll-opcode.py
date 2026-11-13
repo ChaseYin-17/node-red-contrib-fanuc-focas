@@ -53,6 +53,7 @@ import time
 ARGV        = [a for a in sys.argv[1:] if not a.startswith('--')]
 FLAGS       = set(a for a in sys.argv[1:] if a.startswith('--'))
 STUB        = '--stub' in FLAGS          # answer the DLL locally, no controller
+TIER12      = '--tier12' in FLAGS        # also probe the tier-1/2 read set
 
 IP          = ARGV[0] if len(ARGV) > 0 else '192.168.100.128'
 CNC_PORT    = int(ARGV[1]) if len(ARGV) > 1 else 8193
@@ -370,6 +371,61 @@ class ODBAXDT(ctypes.Structure):
                 ('flag', ctypes.c_short), ('reserve', ctypes.c_short)]
 
 
+# ── Structures for the tier-1/2 probe (--tier12) ──────────────────────────────
+# Every one of these comes from Fwlib64.h's 30i variant, which is the header that
+# matches the DLL in docs/FANUC_Focas_API/Fwlib64. Where a struct is a union or
+# carries a MAX_AXIS-sized array, the buffer is declared as raw bytes: this probe
+# exists to pin the REQUEST bytes, and a response buffer that is merely large
+# enough cannot mislead the capture the way a wrong field layout could.
+
+class ODBSEQ(ctypes.Structure):
+    _fields_ = [('dummy', ctypes.c_short * 2), ('data', ctypes.c_long)]
+
+
+class ODBCMD(ctypes.Structure):
+    _fields_ = [('adrs', ctypes.c_char), ('num', ctypes.c_char),
+                ('flag', ctypes.c_short), ('cmd_val', ctypes.c_long),
+                ('dec_val', ctypes.c_long)]
+
+
+class OPMSG3(ctypes.Structure):
+    _fields_ = [('datano', ctypes.c_short), ('type', ctypes.c_short),
+                ('char_num', ctypes.c_short), ('data', ctypes.c_char * 256)]
+
+
+class IODBPMAINTE(ctypes.Structure):
+    _fields_ = [('name', ctypes.c_char * 62), ('type', ctypes.c_long),
+                ('total', ctypes.c_long), ('remain', ctypes.c_long),
+                ('stat', ctypes.c_long)]
+
+
+class ODBSPN(ctypes.Structure):
+    _fields_ = [('datano', ctypes.c_short), ('type', ctypes.c_short),
+                ('data', ctypes.c_short * 8)]
+
+
+class IODBTIMER(ctypes.Structure):
+    # short type | short dummy | union { date{year,month,date} | time{hour,minute,second} }
+    _fields_ = [('type', ctypes.c_short), ('dummy', ctypes.c_short),
+                ('a', ctypes.c_short), ('b', ctypes.c_short), ('c', ctypes.c_short)]
+
+
+class IODBPMC(ctypes.Structure):
+    # short type_a | short type_d | ushort datano_s | ushort datano_e | union[20]
+    _fields_ = [('type_a', ctypes.c_short), ('type_d', ctypes.c_short),
+                ('datano_s', ctypes.c_ushort), ('datano_e', ctypes.c_ushort),
+                ('u', ctypes.c_char * 20)]
+
+
+# ODBNC is a union of {bin: short,short,long,long = 12} and {asc[31]} -> 32 bytes.
+# ALMINFO's MAX_AXIS>16 branch is 5*(4+2+2+32)+4 = 204 bytes.
+# IODBZOFS is a REALDATA array; 4 + 2 + 2 + 16*MAX_AXIS is far more than the DLL
+# writes, and the probe only reads the request side anyway.
+ODBNC_BYTES   = 32
+ALMINFO_BYTES = 204
+IODBZOFS_BYTES = 4 + 2 + 2 + 16 * 32
+
+
 def load_dll():
     if DLL_DIR is None:
         raise SystemExit(
@@ -425,6 +481,36 @@ def bind(fw):
                             ctypes.POINTER(ctypes.c_short),
                             ctypes.POINTER(ctypes.c_short),
                             ctypes.POINTER(ODBPMCALM)]),
+        # ── tier-1/2 probe targets ────────────────────────────────────────────
+        # Prototypes are taken from SpecE's <prottype> (the authoritative source —
+        # Fwlib64.h's 30i variant omits several of these entirely).
+        ('cnc_rdcncid',    [ctypes.c_ushort, ctypes.POINTER(ctypes.c_ulong * 4)]),
+        ('cnc_rdzofsinfo', [ctypes.c_ushort, ctypes.POINTER(ctypes.c_short)]),
+        ('cnc_rdzofs',     [ctypes.c_ushort, ctypes.c_short, ctypes.c_short,
+                            ctypes.c_short, ctypes.c_void_p]),
+        ('cnc_rdseqnum',   [ctypes.c_ushort, ctypes.POINTER(ODBSEQ)]),
+        ('cnc_rdcommand',  [ctypes.c_ushort, ctypes.c_short, ctypes.c_short,
+                            ctypes.POINTER(ctypes.c_short), ctypes.POINTER(ODBCMD)]),
+        ('cnc_rdopmsg3',   [ctypes.c_ushort, ctypes.c_short,
+                            ctypes.POINTER(ctypes.c_short), ctypes.POINTER(OPMSG3)]),
+        ('cnc_statinfo2',  [ctypes.c_ushort, ctypes.c_void_p]),
+        ('cnc_rdproginfo', [ctypes.c_ushort, ctypes.c_short, ctypes.c_short,
+                            ctypes.c_void_p]),
+        ('cnc_rdpm_item',  [ctypes.c_ushort, ctypes.c_short,
+                            ctypes.POINTER(ctypes.c_short),
+                            ctypes.POINTER(IODBPMAINTE)]),
+        ('cnc_rdalminfo',  [ctypes.c_ushort, ctypes.c_short, ctypes.c_short,
+                            ctypes.c_short, ctypes.c_void_p]),
+        ('cnc_rdspgear',   [ctypes.c_ushort, ctypes.c_short, ctypes.POINTER(ODBSPN)]),
+        ('cnc_rdspload',   [ctypes.c_ushort, ctypes.c_short, ctypes.POINTER(ODBSPN)]),
+        ('cnc_rdspmaxrpm', [ctypes.c_ushort, ctypes.c_short, ctypes.POINTER(ODBSPN)]),
+        ('cnc_rdblkcount', [ctypes.c_ushort, ctypes.POINTER(ctypes.c_long)]),
+        ('cnc_rdexecprog', [ctypes.c_ushort, ctypes.POINTER(ctypes.c_ushort),
+                            ctypes.POINTER(ctypes.c_short), ctypes.c_char_p]),
+        ('cnc_gettimer',   [ctypes.c_ushort, ctypes.POINTER(IODBTIMER)]),
+        ('pmc_rdpmcrng',   [ctypes.c_ushort, ctypes.c_short, ctypes.c_short,
+                            ctypes.c_ushort, ctypes.c_ushort, ctypes.c_ushort,
+                            ctypes.POINTER(IODBPMC)]),
     ]:
         fn = getattr(fw, name, None)
         if fn is None:
@@ -436,6 +522,184 @@ def bind(fw):
 
 def h(title):
     print('\n' + '=' * 78 + '\n' + title + '\n' + '=' * 78)
+
+
+# ── Tier-1/2 probe: the reads approved for the node, none of which pause sampling
+# ─────────────────────────────────────────────────────────────────────────────
+# Every function below was checked against its SpecE page before being added here:
+# none carries `stop sampling` / `cnc_stopophis` / `stop logging` in its <doc>,
+# <option> or <mode> section, so none of them interrupts the CNC's own history
+# recording. The functions that DO require cnc_stopophis (cnc_rdalmhistry*,
+# cnc_rdophistry*, cnc_rdalmhisno, cnc_rdophisno4, cnc_rdomhis*) are deliberately
+# absent — see docs/notes.md.
+#
+# The argument values are chosen to be IDENTIFIABLE rather than meaningful, so the
+# request frame shows which slot carries what:
+#   · 258 = 0x0102  — comes back as 00 00 01 02 (one widened long) or 01 02 (two
+#                     packed bytes), which is exactly what has to be known.
+#   · 3 and 5       — small distinct numbers for the second and third slots.
+# A value the library rewrites before sending (a clamped count, a normalised type)
+# is itself evidence, so the printed frame is compared against what was asked for.
+
+def tier12_sequence(fw, handle):
+    print('\n  Reply values below are the controller\'s own; the DLL→CNC frames are')
+    print('  the evidence. A function that answers EW_FUNC/EW_NOOPT still shows its')
+    print('  opcode — that is the point of running it here.')
+
+    def call(label, fn, *args):
+        h(label)
+        try:
+            ret = fn(handle, *args)
+        except Exception as e:                       # noqa: BLE001 - probe, not a library
+            print('\n  %s → raised %s' % (label, e))
+            return None
+        print('\n  %s → %s' % (label, err_name(ret)))
+        return ret
+
+    # ── cnc_rdcncid: the machine's stable identity ────────────────────────────
+    cncid = (ctypes.c_ulong * 4)()
+    if call('cnc_rdcncid', fw.cnc_rdcncid, ctypes.byref(cncid)) == 0:
+        print('    cncid = %s' % ' '.join('%08x' % (v & 0xffffffff) for v in cncid))
+
+    # ── cnc_rdzofsinfo / cnc_rdzofs: work zero offsets ────────────────────────
+    # cnc_rdzofs is the one whose argument packing is NOT settled: docs/notes.md
+    # records EW_ATTRIB for (number, axis, length) while the vendor library got
+    # EW_OK on the same machine. The frame below is what settles it.
+    use_no = ctypes.c_short(0)
+    if call('cnc_rdzofsinfo', fw.cnc_rdzofsinfo, ctypes.byref(use_no)) == 0:
+        print('    use_no = %d' % use_no.value)
+
+    for number, axis in [(1, 1), (1, 2), (2, 1)]:
+        buf = ctypes.create_string_buffer(IODBZOFS_BYTES)
+        call('cnc_rdzofs(number=%d, axis=%d)' % (number, axis),
+             fw.cnc_rdzofs, number, axis, 8, ctypes.byref(buf))
+
+    # ── cnc_rdseqnum: the block being executed ────────────────────────────────
+    seq = ODBSEQ()
+    if call('cnc_rdseqnum', fw.cnc_rdseqnum, ctypes.byref(seq)) == 0:
+        print('    sequence number = %d' % seq.data)
+
+    # ── cnc_rdcommand: modal / commanded F,S,T,B ──────────────────────────────
+    # type -1 = all modal data, -2 = all commanded data; block 1 = active block.
+    for type_, block in [(-1, 1), (-2, 1), (5, 1), (18, 1), (19, 1)]:
+        n = ctypes.c_short(32)
+        cmdbuf = (ODBCMD * 32)()
+        if call('cnc_rdcommand(type=%d, block=%d)' % (type_, block),
+                fw.cnc_rdcommand, type_, block, ctypes.byref(n), cmdbuf) == 0:
+            for i in range(min(n.value, 32)):
+                c = cmdbuf[i]
+                print('    [%d] adrs=%r num=%r flag=0x%04x val=%d dec=%d'
+                      % (i, c.adrs, c.num, c.flag & 0xffff, c.cmd_val, c.dec_val))
+
+    # ── cnc_rdopmsg3: the operator's message ──────────────────────────────────
+    for type_ in (-1, 0, 4):
+        num = ctypes.c_short(1)
+        msg = OPMSG3()
+        if call('cnc_rdopmsg3(type=%d)' % type_,
+                fw.cnc_rdopmsg3, type_, ctypes.byref(num), ctypes.byref(msg)) == 0:
+            print('    datano=%d type=%d char_num=%d data=%r'
+                  % (msg.datano, msg.type, msg.char_num, msg.data))
+
+    # ── cnc_statinfo2: extended run status ────────────────────────────────────
+    st2 = ctypes.create_string_buffer(26)          # ODBST2 = 13 shorts
+    if call('cnc_statinfo2', fw.cnc_statinfo2, ctypes.byref(st2)) == 0:
+        words = struct.unpack('>13h', st2.raw[:26])
+        print('    hdck=%d tmmode=%d aut=%d run=%d motion=%d mstb=%d emergency=%d'
+              % words[:7])
+        print('    alarm=%d edit=%d warning=%d o3dchk=%d ext_opt=%d restart=%d'
+              % words[7:])
+
+    # ── cnc_rdproginfo: program memory ────────────────────────────────────────
+    # type 0 = binary (ODBNC.bin), length = sizeof(ODBNC) = 32.
+    for type_, length in [(0, ODBNC_BYTES), (1, ODBNC_BYTES)]:
+        nc = ctypes.create_string_buffer(ODBNC_BYTES)
+        if call('cnc_rdproginfo(type=%d, length=%d)' % (type_, length),
+                fw.cnc_rdproginfo, type_, length, ctypes.byref(nc)) == 0:
+            if type_ == 0:
+                reg, unreg, used, unused = struct.unpack('>hhiI', nc.raw[:12])
+                print('    registered=%d available=%d used_mem=%d unused_mem=%d'
+                      % (reg, unreg, used, unused))
+            else:
+                print('    asc=%r' % nc.raw[:31])
+
+    # ── cnc_rdpm_item: maintenance items 1..10 ────────────────────────────────
+    n = ctypes.c_short(10)
+    items = (IODBPMAINTE * 10)()
+    if call('cnc_rdpm_item(start=1, num=10)',
+            fw.cnc_rdpm_item, 1, ctypes.byref(n), items) == 0:
+        for i in range(min(n.value, 10)):
+            it = items[i]
+            print('    [%d] name=%r type=%d total=%d remain=%d stat=%d'
+                  % (i + 1, it.name, it.type, it.total, it.remain, it.stat))
+
+    # ── cnc_rdalminfo: detailed current alarms ────────────────────────────────
+    # type 0 = without message, 1 = with message; alm_type -1 = all types.
+    for type_ in (0, 1):
+        buf = ctypes.create_string_buffer(ALMINFO_BYTES)
+        call('cnc_rdalminfo(type=%d, alm_type=-1)' % type_,
+             fw.cnc_rdalminfo, type_, -1, ALMINFO_BYTES, ctypes.byref(buf))
+
+    # ── cnc_rdspgear / cnc_rdspload / cnc_rdspmaxrpm: serial spindle ──────────
+    for name in ('cnc_rdspgear', 'cnc_rdspload', 'cnc_rdspmaxrpm'):
+        spn = ODBSPN()
+        if call(name, getattr(fw, name), -1, ctypes.byref(spn)) == 0:
+            print('    datano=%d data=%s' % (spn.datano, list(spn.data)))
+
+    # ── cnc_rdblkcount: block counter (needs Program restarting) ──────────────
+    bc = ctypes.c_long(0)
+    if call('cnc_rdblkcount', fw.cnc_rdblkcount, ctypes.byref(bc)) == 0:
+        print('    block counter = %d' % bc.value)
+
+    # ── cnc_rdexecprog: the block being executed ──────────────────────────────
+    # Read twice: if the returned block number advances between two calls made
+    # while the machine is idle, this function moves the execution pointer and
+    # must NOT be wired into the node. That is the check docs/notes.md asks for.
+    #
+    # SKIPPED UNDER --stub. The stub answers every unknown function with an empty
+    # success, and this one's handler writes `*length` bytes into the caller's
+    # buffer from a reply it expects to be non-empty — an empty one makes it fault
+    # inside the DLL (access violation, not a Python exception, so it cannot be
+    # caught). Its opcode is 0x0020, captured from the frame the DLL put on the
+    # wire before the fault; the pointer check itself needs a real controller.
+    if STUB:
+        h('cnc_rdexecprog — SKIPPED under --stub')
+        print('  opcode already captured as 0x0020; the "does it move the execution')
+        print('  pointer" check needs a live controller. Re-run without --stub.')
+    else:
+        for attempt in (1, 2):
+            length = ctypes.c_ushort(256)
+            blknum = ctypes.c_short(0)
+            data = ctypes.create_string_buffer(256)
+            if call('cnc_rdexecprog (attempt %d)' % attempt,
+                    fw.cnc_rdexecprog, ctypes.byref(length), ctypes.byref(blknum),
+                    data) == 0:
+                print('    length=%d blknum=%d data=%r'
+                      % (length.value, blknum.value, data.value[:length.value]))
+
+    # ── cnc_gettimer: CNC calendar (date and time are separate calls) ─────────
+    for type_, label in [(0, 'date'), (1, 'time')]:
+        timer = IODBTIMER()
+        timer.type = type_
+        if call('cnc_gettimer(type=%d, %s)' % (type_, label),
+                fw.cnc_gettimer, ctypes.byref(timer)) == 0:
+            print('    %s = %d / %d / %d' % (label, timer.a, timer.b, timer.c))
+
+    # ── pmc_rdpmcrng: PMC data window ─────────────────────────────────────────
+    # adr_type 9 = D (data table), data_type 2 = word, D100..D103 = 2 words.
+    # The length is 8 + N*width, which is the form docs/notes.md records.
+    for adr_type, data_type, s, e, length, label in [
+        (9, 2, 100, 103, 12, 'D100 word x2'),
+        (9, 0, 100, 100, 9,  'D100 byte'),
+        (5, 1, 0,   0,   9,  'R0 bit'),
+    ]:
+        buf = IODBPMC()
+        if call('pmc_rdpmcrng(%s: adr=%d type=%d %d..%d len=%d)'
+                % (label, adr_type, data_type, s, e, length),
+                fw.pmc_rdpmcrng, adr_type, data_type, s, e, length,
+                ctypes.byref(buf)) == 0:
+            print('    type_a=%d type_d=%d datano_s=%d datano_e=%d u=%s'
+                  % (buf.type_a, buf.type_d, buf.datano_s, buf.datano_e,
+                     buf.u.hex(' ')))
 
 
 # ── Stub mode sequence ────────────────────────────────────────────────────────
@@ -467,6 +731,9 @@ def stub_sequence(fw, handle):
                               ctypes.byref(exist), buf)
         print('\n  pmc_rdalmmsg(s_number=%d, read_num=%d) → %s'
               % (s_number, read_num, err_name(ret)))
+
+    if TIER12:
+        tier12_sequence(fw, handle)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -634,6 +901,9 @@ def main():
           % (err_name(ret), nread.value, exist.value))
     for i in range(min(nread.value, 10)):
         print('    [%d] %r' % (i, pmcbuf[i].almmsg))
+
+    if TIER12:
+        tier12_sequence(fw, handle)
 
     h('Closing')
     ret = fw.cnc_freelibhndl(handle)
