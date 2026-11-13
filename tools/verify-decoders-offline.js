@@ -320,6 +320,75 @@ const mk = () => {
     check('mstb 1 reads "Finished"', r.mstb === 'Finished', JSON.stringify(r.mstb));
     check('motion 2 reads "Dwelling", not "Moving"', r.motion === 'Dwelling', JSON.stringify(r.motion));
 
+    // ── 11. Tool offsets ─────────────────────────────────────────────────────
+    h('11 — tool offsets: tofsinfo shorts, 8-byte records, and the type mapping');
+    // cnc_rdtofsinfo answered `00 00 00 63 00 02 00 00` on the 31i at 10.192.233.166.
+    // As four shorts that is ofs_type 0 (memory A) and use_no 99 — both values the
+    // spec's enum allows. As two longs it would be ofs_type 99, which the enum does
+    // not contain, so the shorts are the right reading.
+    script = [reply('00 00 00 63 00 02 00 00')];
+    r = await mk().readtofsinfo();
+    check('ofs_type 0 = memory A, use_no 99',
+          r.ofs_type === 0 && r.use_no === 99 && r.memory === 'memory A', JSON.stringify(r));
+
+    // cnc_rdtofs(1, type=3) answered one 8-byte record: 129907 at dec 3 = 129.907 mm.
+    script = [reply('00 01 fb 73 00 0a 00 03')];
+    r = await mk().readtofs(1, 3);
+    check('one 8-byte record decodes to 129.907',
+          r.value === 129.907 && r.raw === 129907 && r.dec === 3, JSON.stringify(r));
+    check('the request sends (number, number, 1000+type)',
+          sent[sent.length - 1].args[0] === 1 && sent[sent.length - 1].args[1] === 1 &&
+          sent[sent.length - 1].args[2] === 1003, JSON.stringify(sent[sent.length - 1].args));
+
+    // cnc_rdtofsr(1, 5, type=0) answered five records with NO header — the values are
+    // the tool-length geometry column. A decoder that expected IODBTO's
+    // `datano_s | type | datano_e` prefix would read 129907 as a "datano".
+    script = [reply('00 01 fb 73 00 0a 00 03' + '00 02 14 bb 00 0a 00 03' +
+                    '00 01 7e 36 00 0a 00 03' + '00 01 e9 b1 00 0a 00 03' +
+                    '00 01 84 fd 00 0a 00 03')];
+    r = await mk().readtofsr(1, 5, 0);
+    check('five records, no header: 129.907 … 99.581',
+          r.length === 5 && r[0].value === 129.907 && r[4].value === 99.581,
+          JSON.stringify(r.map(x => x.value)));
+
+    // The range form's type numbering is not the single form's: measured over the whole
+    // table, range type = 3 - single type. The node maps the spec enum onto it, so the
+    // request order is range 3, 2, 1, 0 — and each answer carries the SINGLE type's
+    // values. The fixtures below are the measured columns:
+    //   range 3 → single 0 (cutter radius wear)      = 0, 0
+    //   range 2 → single 1 (cutter radius geometry)  = 0, 0
+    //   range 1 → single 2 (tool length wear)        = 0.080, 0
+    //   range 0 → single 3 (tool length geometry)    = 129.907, 136.379
+    // fnToolOffsets reads tofsinfo first, then one range per type. The tofsinfo fixture
+    // is four shorts: ofs_type 0, use_no 2 → `00 00 | 00 02 | 00 00 | 00 00`.
+    script = [reply('00 00 00 02 00 00 00 00'),   // tofsinfo: ofs_type 0, use_no 2
+              reply('00 00 00 00 00 0a 00 03' + '00 00 00 00 00 0a 00 03'),  // range 3
+              reply('00 00 00 00 00 0a 00 03' + '00 00 00 00 00 0a 00 03'),  // range 2
+              reply('00 00 00 50 00 0a 00 03' + '00 00 00 00 00 0a 00 03'),  // range 1
+              reply('00 01 fb 73 00 0a 00 03' + '00 02 14 bb 00 0a 00 03')]; // range 0
+    sent = [];
+    r = await poll('tool_offsets');
+    // The first request is cnc_rdtofsinfo (no arguments); the four after it are the
+    // range reads, one per type.
+    const asked = sent.slice(1).map(s => s.args[2]);
+    check('the node asks for range types 3,2,1,0 (the spec enum mapped onto the wire)',
+          JSON.stringify(asked) === '[3,2,1,0]', JSON.stringify(asked));
+    check('one entry per offset, each carrying all four types',
+          r.offsets.length === 2 && Object.keys(r.offsets[0].values).length === 4,
+          JSON.stringify(r.offsets.map(o => o.number)));
+    check('offset 1 type 3 (tool length geometry) is 129.907',
+          r.offsets[0].values[3].value === 129.907, JSON.stringify(r.offsets[0].values[3]));
+    check('offset 1 type 0 (cutter radius wear) is 0',
+          r.offsets[0].values[0].value === 0, JSON.stringify(r.offsets[0].values[0]));
+    check('offset 2 type 3 (tool length geometry) is 136.379',
+          r.offsets[1].values[3].value === 136.379, JSON.stringify(r.offsets[1].values[3]));
+
+    // A machine without the option must surface EW_NOOPT, not an empty table.
+    script = [{ len: 0, error: 6 }];
+    threw = null;
+    try { await mk().readtofsinfo(); } catch (e) { threw = e.message; }
+    check('a missing tool-compensation option raises EW_NOOPT', /EW_NOOPT/.test(threw || ''), threw);
+
     h(failures === 0 ? `PASS — ${'all'} decoder checks hold`
                      : `FAIL — ${failures} assertion(s) failed`);
     process.exit(failures === 0 ? 0 : 1);

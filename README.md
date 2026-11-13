@@ -67,7 +67,7 @@ npm install node-red-contrib-fanuc-focas
 
 | Function | Description | `msg.payload` fields |
 |----------|-------------|----------------------|
-| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `axes_data`, `tool_life`, `active_alarms`, `alarm_status`, `pmc_alarms`, `errors` |
+| **All Data** | Full combined snapshot | `controller`, `machine_state`, `active_program`, `timers`, `part_count`, `feedrate_spindle`, `axes_data`, `tool_life`, `tool_offsets`, `active_alarms`, `alarm_status`, `pmc_alarms`, `errors` |
 | **Status Info** | Machine run state | `mode`, `run_state`, `motion`, `mstb`, `emergency`, `alarm`, `edit` |
 | **System Info** | Controller identity | `cnc_type`, `mt_type`, `series`, `version`, `axes`, `max_axes` |
 
@@ -80,6 +80,7 @@ npm install node-red-contrib-fanuc-focas
 | **Program Number** | Active program | `running_program`, `main_program`, `running_comment`, `main_comment` |
 | **Part Count** | Parts produced | `required_parts`, `lifetime_total` |
 | **Tool Life** | Per-group tool life | `group_count`, `using_group`, `groups[]`, `most_used_group`, … |
+| **Tool Offsets** | Tool compensation table (read-only) | `ofs_type`, `memory`, `use_no`, `types[]`, `offsets[]` |
 | **Alarm Messages** | Active alarms | Array of `{ type, type_code, code, axis, text }` |
 | **Alarm Status** | Alarm status word | `status`, `bits[]` of `{ bit, label }` |
 | **PMC Alarms** | PMC's own ERxx/WNxx messages | Array of `{ message }` |
@@ -303,6 +304,56 @@ plus the group the machine is currently working through.
 > that failed). Only `cnc_rdgrpinfo4` is required — without the option it is what raises
 > `EW_NOOPT`.
 
+### Tool offsets
+
+**Tool Offsets** reads the tool compensation table: how many offsets the machine has, and
+every offset's value per type.
+
+```json
+{
+  "ofs_type": 0,
+  "memory": "memory A",
+  "use_no": 99,
+  "types": [
+    { "type": 0, "label": "cutter radius wear" },
+    { "type": 1, "label": "cutter radius geometry" },
+    { "type": 2, "label": "tool length wear" },
+    { "type": 3, "label": "tool length geometry" }
+  ],
+  "offsets": [
+    {
+      "number": 1,
+      "values": {
+        "0": { "label": "cutter radius wear",     "value": 0,       "raw": 0,     "dec": 3 },
+        "1": { "label": "cutter radius geometry", "value": 0,       "raw": 0,     "dec": 3 },
+        "2": { "label": "tool length wear",       "value": 0.08,    "raw": 80,    "dec": 3 },
+        "3": { "label": "tool length geometry",   "value": 129.907, "raw": 129907, "dec": 3 }
+      }
+    }
+  ]
+}
+```
+
+> **Read-only.** The node has no write path for offsets — not a disabled one, an absent
+> one. A wrong write opcode changes a machine's offsets, and none of the write calls
+> (`cnc_wrtofs`, `cnc_wrtofsr`, `cnc_wrzofs`) has been captured from the vendor library.
+>
+> `raw` and `dec` are carried alongside `value` so the unscaled integer is available when
+> the decimal position matters. `unit` is on the wire but read 10 on every record measured,
+> which is not the `LOADELM` unit enum, so it is not interpreted.
+>
+> The type numbers follow the spec's per-series enum, and the **label comes from the
+> controller's `mt_type`**: an M series has cutter radius / tool length, a T series has
+> X / Z / nose R under the same numbers.
+>
+> The table is read with `cnc_rdtofsr` (one call per type) rather than one call per offset:
+> measured on a 31i, 396 single reads took 5.5 s against 163 ms for four range reads. The
+> range form's `type` numbering is **not** the single form's — measured over the whole
+> table, `range type = 3 − single type` — so the node maps the spec enum onto it.
+>
+> Needs the CNC's tool compensation option; without it the controller answers `EW_NOOPT`
+> and the field is `null` with the reason in `errors`.
+
 ### Partial failures — All Data
 
 `All Data` reads every field independently, so one failing function degrades **only that field**
@@ -328,6 +379,9 @@ The rules:
   same key, so a single failure degrades the whole block to `null` with one `errors` entry.
   On a machine without the tool-life option that is how `tool_life` reads —
   `null` plus `"tool_life": "cnc_rdgrpinfo4: CNC returned EW_NOOPT (6)"`.
+- `tool_offsets` is one field too, and degrades the same way — on a machine without the
+  tool-compensation option it is `null` with `"tool_offsets": "cnc_rdtofsinfo: CNC returned
+  EW_NOOPT (6)"`.
 - `errors` is `{}` when every field read cleanly.
 - `active_alarms` is **`null` when the alarm read failed** and **`[]` when the controller
   answered but has no active alarms** — the two are deliberately distinguishable.
@@ -408,6 +462,24 @@ The rules:
         "life_rest_raw": 0 }
     ],
     "most_used_group": 1
+  },
+  "tool_offsets": {
+    "ofs_type": 0,
+    "memory": "memory A",
+    "use_no": 99,
+    "types": [
+      { "type": 0, "label": "cutter radius wear" },
+      { "type": 1, "label": "cutter radius geometry" },
+      { "type": 2, "label": "tool length wear" },
+      { "type": 3, "label": "tool length geometry" }
+    ],
+    "offsets": [
+      { "number": 1, "values": {
+          "0": { "label": "cutter radius wear",     "value": 0,       "raw": 0,      "dec": 3 },
+          "1": { "label": "cutter radius geometry", "value": 0,       "raw": 0,      "dec": 3 },
+          "2": { "label": "tool length wear",       "value": 0.08,    "raw": 80,     "dec": 3 },
+          "3": { "label": "tool length geometry",   "value": 129.907, "raw": 129907, "dec": 3 } } }
+    ]
   },
   "active_alarms": [],
   "alarm_status": { "status": 0, "bits": [] },

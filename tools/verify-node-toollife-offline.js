@@ -95,6 +95,11 @@ function stubPeripherals() {
     Focas.prototype.readaxiscount       = async () => 3;
     Focas.prototype.readaxisnames       = async () => ['X', 'Y', 'Z'];
     Focas.prototype.readspindlenames    = async () => ['S'];
+    // Tool offsets: the All Data field reads the table size then one range per type.
+    Focas.prototype.readtofsinfo        = async () => ({ ofs_type: 0, memory: 'memory A', use_no: 2 });
+    Focas.prototype.readtofsr           = async (s, e) => Array.from(
+        { length: e - s + 1 }, (_, i) => ({ value: i + 1, raw: (i + 1) * 1000, dec: 3, unit: 10 }));
+    Focas.prototype.tofsTypeName        = (t) => `type ${t}`;
 }
 
 // ── Section 1: wire offsets ───────────────────────────────────────────────────

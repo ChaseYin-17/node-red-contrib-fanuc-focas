@@ -485,3 +485,125 @@ magnitudes now.
 `cnc_sysinfo` on this machine reports `max_axis = 32` and `axes = "05"`. The node's
 `fnSystemInfo()` reported `axes: si.maxaxis`, i.e. **32 for a 5-axis machine**.
 
+---
+
+## Tool offsets: the opcodes this project would have guessed are all wrong
+
+Measured 2026-11-13 on the same 31i at `10.192.233.166:8193` (`cnc_type` `31`, `mt_type`
+` M`, series `G40A`). **The node implements no tool-offset function at all** — this section
+exists so the next person does not start from the numbers that look obvious.
+
+The SDK documents `cnc_rdtofs` / `cnc_rdtofsr` / `cnc_rdtofsinfo` / `cnc_rdzofs` /
+`cnc_rdzofsinfo` but, as everywhere else here, **not their function codes**. Probing the
+codes that look adjacent to the other `Ncdata` reads (`0x2c`, `0x2d`, `0x2e`, `0x2a`,
+`0x2b`) gets answers — and every one of them is a *different function*:
+
+| call | guessed | what the guess actually did |
+|---|---|---|
+| `cnc_rdtofs`   | `0x2c` | answered 12 bytes, **identical for every offset number and type** |
+| `cnc_rdtofsr`  | `0x2d` | answered 8 bytes, identical for every range |
+| `cnc_rdtofsinfo` | `0x2e` | `EW_NUMBER (3)` |
+| `cnc_rdzofs`   | `0x2a` | `EW_FUNC (1)` |
+| `cnc_rdzofsinfo` | `0x2b` | `EW_LENGTH (2)` |
+
+An answer that never changes with its arguments is the signature of a wrong opcode: the
+controller is answering some other function and nothing in the reply says so. Captured
+from the vendor library with `tools/probe-dll-tofs.py` (same proxy technique as
+`probe-dll-opcode.py`), the real codes are:
+
+| call | wire func | c1/c2 | request args |
+|---|---|---|---|
+| `cnc_rdtofs`     | **`0x08`** | 1 / 1 | `number`, `type`, `length` |
+| `cnc_rdtofsr`    | **`0x08`** | 1 / 1 | `s_number`, `e_number`, `type` |
+| `cnc_rdtofsinfo` | **`0x0a`** | 1 / 1 | — |
+| `cnc_rdzofs`     | **`0x0b`** | 1 / 1 | `number`, `axis`, `length` |
+| `cnc_rdzofsinfo` | **`0x0d`** | 1 / 1 | — |
+| `cnc_tofs_rnge`  | **`0xc8`** | 1 / 1 | `type`, `0`, `0x3638` |
+
+`cnc_rdtofs` and `cnc_rdtofsr` are **the same opcode** `0x08`, told apart by the argument
+pattern: `(number, type, length)` reads one value, `(s_number, e_number, type)` reads a
+range. The library sends `args=1 1 1002 0 0` for `cnc_rdtofs(1, type=2)` — the third word
+is `1000 + type`, not a length — and `args=1 5 1 0 0` for `cnc_rdtofsr(1, type=1, 5)`.
+
+### Response layouts
+
+Every one of these answers a plain run of **8-byte records** — `value(i32) | dec(i16) |
+unit(i16)` — with **no header**. That is the same record shape `cnc_rdparam3` and
+`cnc_rdsvmeter` use, and it is not the C struct in any of the three cases.
+
+`cnc_rdtofs` answers one record (8 bytes):
+
+```
+value(i32) | dec(i16) | unit(i16)
+```
+
+Measured `number=1 type=2` → `00 00 00 50 | 00 0a | 00 03` = 80 at dec 0, unit 3.
+
+`cnc_rdtofsr` answers `8·N` bytes, one record per offset in the range, **no header**:
+
+```
+record[N] of value(i32) | dec(i16) | unit(i16)
+```
+
+Measured `s=1 type=0 e=5` → five records `129907, 136379, 97846, 125361, 99581`, all at
+dec 3 → 129.907, 136.379, 97.846, 125.361, 99.581 mm. Those are tool-length compensation
+values, which is what type 0 means on this M-series machine.
+
+> The first attempt at decoding these assumed a `datano_s | type | datano_e` header
+> because `IODBTO` has one. It does not: the wire drops it, exactly as it drops
+> `ODBALM`'s `dummy[2]` and `ODBUSEGR`'s `datano`/`type`. Reading a header out of the
+> first record turns the first offset value into a "datano" and shifts every value after
+> it — the numbers still look plausible, which is why this has to be checked against a
+> known-good value rather than eyeballed.
+
+`cnc_rdtofsinfo` answers 8 bytes: `ofs_type(i32) | use_no(i32)` — measured `00 00 00 63 |
+00 02 00 00` = `ofs_type 99`, `use_no 131072`. The second word does **not** read as a
+small count, so it is not `use_no` in the C sense; treat only `ofs_type` as trustworthy
+until a machine with a different table size is measured.
+
+`cnc_rdzofsinfo` answers 4 bytes: `ofs_type(i32)` = 307.
+
+`cnc_rdzofs` answered `EW_ATTRIB (4)` for every axis tried (1, 2, 3) and `EW_NUMBER (3)`
+for `number=2`, so its layout is **not measured** — the vendor library got `EW_OK` with
+`axis=1` on the same machine minutes earlier, which means the argument packing differs
+from `(number, axis, length)`. Do not implement it from this note.
+
+### Offset type numbers (from the spec, not measured)
+
+`cnc_rdtofs.xml` gives the `type` enum per series. On this M-series machine the four that
+answered were 0/1 (cutter radius wear/geometry) and 2/3 (tool length wear/geometry);
+30i adds 6/7 (imaginary tool nose) and 10/11 (corner R). T series uses 0/1 X, 2/3 Z,
+4/5 nose R, 6/7 imaginary nose, 8/9 Y, 30/31 4th axis, 32/33 5th axis.
+
+### The two forms use different type numbers
+
+`cnc_rdtofs` (single) and `cnc_rdtofsr` (range) are the same opcode but **do not agree on
+what a type number means**. Measured over offsets 1..20 on the 31i at 10.192.233.166:
+
+| single type (spec enum) | range type | values |
+|---|---|---|
+| 0 cutter radius wear | **3** | `0, 0, -0.005, 0, 0` |
+| 1 cutter radius geometry | **2** | `0, 0, 0, 0, 0` |
+| 2 tool length wear | **1** | `0.08, 0, 0.02, 0.2, 0.15` |
+| 3 tool length geometry | **0** | `129.907, 136.379, 97.846, 125.361, 99.581` |
+
+So `range type = 3 − single type` for the four types this machine has. The single form
+follows the spec's enum; the range form does not. `fanuc-focas.js` keeps
+`TOFS_RANGE_TYPE` for the mapping rather than assuming either numbering.
+
+Types 4..11 are `EW_ATTRIB` on this machine in **both** forms — it has only the four.
+
+### What is implemented
+
+`focas.js` has `readtofsinfo()`, `readtofs(number, type)` and `readtofsr(s, e, type)`, and
+`fanuc-focas.js` exposes them as the **Tool Offsets** function and the `tool_offsets` field
+of `All Data`. The node uses the range form (one call per type) because it is 33× faster:
+396 single reads took 5.5 s against 163 ms for four range reads.
+
+**The write side is deliberately absent.** `cnc_wrtofs` (0x09), `cnc_wrtofsr` and
+`cnc_wrzofs` (0x0c) have not been captured, and a wrong write opcode changes a machine's
+offsets. Capture them with `tools/probe-dll-tofs.py` before adding any of them.
+
+`cnc_rdzofs` is also still unimplemented: its argument packing is not settled (see above),
+so it is a probe (`tools/probe-tofs.js`) rather than a decoder.
+

@@ -81,6 +81,49 @@ const IODBTGI4_BYTES  = 28;    // 7 * long: grp_no, n_tool, life, counter, type,
 // 2026-11-12 on the 31i at 10.192.233.166 — see listprog() and docs/notes.md.
 const PROGDIR_RECORD_BYTES = 72;
 
+// ── Tool-offset function codes ────────────────────────────────────────────────
+// Captured from the vendor library with tools/probe-dll-tofs.py on the 31i at
+// 10.192.233.166 (2026-11-13). The codes that look adjacent to the other Ncdata reads
+// (0x2c/0x2d/0x2e) are NOT these functions: they answer, but with the same bytes for
+// every offset number and type — the signature of a wrong opcode. See docs/notes.md.
+//
+//     cnc_rdtofs     0x08   c1=1 c2=1   args (number, number, 1000+type)
+//     cnc_rdtofsr    0x08   c1=1 c2=1   args (s_number, e_number, type)
+//     cnc_rdtofsinfo 0x0a   c1=1 c2=1   no arguments
+//
+// cnc_rdtofs and cnc_rdtofsr are the SAME opcode, told apart by the argument pattern.
+const FN_RDTOFS     = 0x08;   // cnc_rdtofs / cnc_rdtofsr
+const FN_RDTOFSINFO = 0x0a;   // cnc_rdtofsinfo
+
+// Every one of these answers a plain run of 8-byte records — value(i32) | dec(i16) |
+// unit(i16) — with NO header, not the ODBTOFS/IODBTO C struct. Measured: cnc_rdtofsr
+// type=0 offsets 1..5 returned 129.907, 136.379, 97.846, 125.361, 99.581 mm.
+const TOFS_RECORD_BYTES = 8;
+
+// cnc_rdtofs's third argument is 1000 + type, not a length. The vendor library sends
+// `args=1 1 1002` for cnc_rdtofs(1, type=2).
+const TOFS_SINGLE_BASE = 1000;
+
+// The single form's `type` follows the spec's M-series enum (0 cutter-radius wear,
+// 1 cutter-radius geometry, 2 tool-length wear, 3 tool-length geometry). The RANGE
+// form uses a different numbering: measured on the same machine, range type 0 is the
+// same values as single type 3, range type 1 = single type 2, range type 3 = single
+// type 0. Only the single form is exposed, so the spec's enum applies.
+const TOFS_TYPES_M = {
+    0: 'cutter radius wear', 1: 'cutter radius geometry',
+    2: 'tool length wear',   3: 'tool length geometry',
+    6: 'imaginary tool nose wear', 7: 'imaginary tool nose geometry',
+    10: 'corner R wear',     11: 'corner R geometry',
+};
+const TOFS_TYPES_T = {
+    0: 'X wear', 1: 'X geometry', 2: 'Z wear', 3: 'Z geometry',
+    4: 'nose R wear', 5: 'nose R geometry',
+    6: 'imaginary tool nose wear', 7: 'imaginary tool nose geometry',
+    8: 'Y wear', 9: 'Y geometry',
+    30: '4th axis wear', 31: '4th axis geometry',
+    32: '5th axis wear', 33: '5th axis geometry',
+};
+
 // How many groups to ask for in one cnc_rdgrpinfo4 call. The controller has an
 // undocumented ceiling on num_to_read — on the 31i measured 2026-09-28 the request is
 // answered normally up to 103 and rejected with EW_PROTOCOL on frame type 0x2103 from
@@ -905,6 +948,92 @@ class Focas {
         const st = await this._reqSingle(1, 1, FN_SPMETER, type, ALLAXIS);
         if (st.len <= 0) throw new Error(reqErr('cnc_rdspmeter', st, `for type=${type}`));
         return this._loadReadings(st.data, SPMETER_STRIDE, count).map(Math.abs);
+    }
+
+    // ── Tool offsets (read-only) ──────────────────────────────────────────────
+    // Tool compensation is a separate CNC option on some machines; without it these
+    // answer EW_NOOPT (6) and the caller sees that rather than a table of zeroes.
+    //
+    // Only the READ side is implemented. The write calls (cnc_wrtofs 0x09,
+    // cnc_wrtofsr, cnc_wrzofs 0x0c) are deliberately absent: a wrong write opcode
+    // changes a machine's offsets, and none of them has been captured. See
+    // docs/notes.md before adding one.
+
+    // cnc_rdtofsinfo — the offset table's shape. The wire is 8 bytes of four shorts,
+    // NOT two longs: `00 00 00 63 00 02 00 00` reads as ofs_type 0 (memory A) and
+    // use_no 99, which is what the spec's enum allows. Read as two longs it would say
+    // ofs_type 99 — a value the enum does not contain — so the shorts are the right
+    // reading. Measured 2026-11-13 on the 31i at 10.192.233.166.
+    async readtofsinfo() {
+        const st = await this._reqSingle(1, 1, FN_RDTOFSINFO);
+        if (st.error !== undefined || st.len < 4)
+            throw new Error(reqErr('cnc_rdtofsinfo', st));
+        const ofsType = st.data.readInt16BE(0);
+        const useNo   = st.data.readInt16BE(2);
+        return {
+            ofs_type: ofsType,
+            // 0 = memory A, 1 = memory B, 2 = memory C, 10 = milling+turning (30i).
+            memory:   ofsType === 10 ? 'milling+turning' : `memory ${'ABC'[ofsType] ?? '?'}`,
+            use_no:   useNo,
+        };
+    }
+
+    // cnc_rdtofs — one offset value. The third argument is 1000 + type, not a length:
+    // the vendor library sends `args=1 1 1002` for cnc_rdtofs(1, type=2).
+    //
+    // The reply is ONE 8-byte record — value(i32) | dec(i16) | unit(i16) — with no
+    // header, not ODBTOFS's `short datano | short type | long data`. Measured:
+    // number=1 type=3 → 129.907 mm (tool length geometry).
+    async readtofs(number, type = 0) {
+        const st = await this._reqSingle(1, 1, FN_RDTOFS, number, number,
+                                         TOFS_SINGLE_BASE + type);
+        if (st.error !== undefined)
+            throw new Error(reqErr('cnc_rdtofs', st, `for number=${number} type=${type}`));
+        if (st.len < TOFS_RECORD_BYTES)
+            throw new Error(reqErr('cnc_rdtofs', st, `for number=${number} type=${type}`));
+        return this._tofsRecord(st.data, 0);
+    }
+
+    // cnc_rdtofsr — a range of offsets, same opcode 0x08 with the (s, e, type) pattern.
+    // The reply is a plain run of 8-byte records with NO header — IODBTO's
+    // `datano_s | type | datano_e` prefix is not on the wire. Reading a header out of
+    // the first record turns the first offset into a "datano" and shifts every value
+    // after it, and the numbers still look plausible, so the count is taken from the
+    // payload length and nothing else.
+    //
+    // NOTE the range form's `type` numbering is NOT the single form's: measured on the
+    // same machine, range type 0 returned the same values as single type 3. Callers
+    // that want the spec's enum should use readtofs() per number.
+    async readtofsr(sNumber, eNumber, type = 0) {
+        const st = await this._reqSingle(1, 1, FN_RDTOFS, sNumber, eNumber, type);
+        if (st.error !== undefined)
+            throw new Error(reqErr('cnc_rdtofsr', st,
+                `for s=${sNumber} e=${eNumber} type=${type}`));
+        if (st.len < TOFS_RECORD_BYTES)
+            throw new Error(reqErr('cnc_rdtofsr', st,
+                `for s=${sNumber} e=${eNumber} type=${type}`));
+        const n = Math.floor(st.len / TOFS_RECORD_BYTES);
+        const out = [];
+        for (let i = 0; i < n; i++) out.push(this._tofsRecord(st.data, i * TOFS_RECORD_BYTES));
+        return out;
+    }
+
+    // One 8-byte offset record: value(i32) | dec(i16) | unit(i16). The unit word read
+    // 10 on every record measured, which is not the LOADELM unit enum — it is carried
+    // through raw rather than interpreted.
+    _tofsRecord(data, off) {
+        const raw  = data.readInt32BE(off);
+        const unit = data.readInt16BE(off + 4);
+        const dec  = data.readInt16BE(off + 6);
+        return { value: raw / Math.pow(10, dec), raw, dec, unit };
+    }
+
+    // The offset types this machine's M/T mode actually has, for labelling a payload.
+    // The enum is per-series (cnc_rdtofs.xml); the controller's mt_type picks it.
+    tofsTypeName(type) {
+        const t = String((this.sysinfo && this.sysinfo.mttype) || '').trim();
+        const table = t === 'T' || t === 'TT' || t === 'MT' ? TOFS_TYPES_T : TOFS_TYPES_M;
+        return table[type] ?? `type ${type}`;
     }
 
     // ── Axis / spindle names ──────────────────────────────────────────────────

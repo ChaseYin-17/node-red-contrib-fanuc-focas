@@ -22,7 +22,8 @@ try {
     // The alarm_status / pmc_alarms fields call these. Without the check the failure is
     // "readalarmstatus2 is not a function" at poll time, once per poll, instead of a
     // load-time error naming the file that needs updating.
-    for (const method of ['readalarmstatus2', 'readpmcalarm']) {
+    for (const method of ['readalarmstatus2', 'readpmcalarm',
+                          'readtofsinfo', 'readtofs', 'tofsTypeName']) {
         if (typeof Focas.prototype[method] !== 'function') {
             throw new Error(
                 `focas.js has no Focas.prototype.${method}. ` +
@@ -368,6 +369,64 @@ async function fnPmcAlarms(focas) {
     return out;
 }
 
+// ── Tool offsets (read-only) ──────────────────────────────────────────────────
+// The compensation table: how many offsets the machine has, and the values. Read with
+// cnc_rdtofsinfo + cnc_rdtofsr, whose opcodes were captured from the vendor library
+// (0x0a and 0x08 — see docs/notes.md; the 0x2c/0x2d/0x2e that look adjacent are other
+// functions and answer the same bytes for every argument).
+//
+// Only reads. There is no write path here on purpose: a wrong write opcode changes a
+// machine's offsets, and none of the write calls has been captured.
+//
+// The range form is used because it is 33x faster than one call per offset — measured
+// on the 31i at 10.192.233.166, 396 single reads took 5.5 s against 163 ms for four
+// range reads. Its `type` numbering is NOT the single form's, though: measured over
+// the whole table, range type = 3 - single type, so the spec's enum (which the single
+// form follows) is mapped onto it here rather than being assumed.
+const TOFS_MAX_OFFSETS = 999;   // the largest table the spec lists; a bad use_no is clamped
+
+// single type (spec enum) → range type. Measured 2026-11-13 on the 31i at
+// 10.192.233.166 over offsets 1..20: single 0↔range 3, 1↔2, 2↔1, 3↔0.
+const TOFS_RANGE_TYPE = { 0: 3, 1: 2, 2: 1, 3: 0 };
+
+async function fnToolOffsets(focas) {
+    const info = await focas.readtofsinfo();
+    // The four types an M series has: cutter radius and tool length, wear and geometry.
+    // A T series has X/Z/nose-R under the same numbers, so the label comes from the
+    // controller's mt_type via tofsTypeName().
+    const TYPES = [0, 1, 2, 3];
+    const count = Math.min(Math.max(0, info.use_no | 0), TOFS_MAX_OFFSETS);
+
+    // One range read per type, then transpose into one entry per offset number.
+    const byType = {};
+    for (const t of TYPES) {
+        const rangeType = TOFS_RANGE_TYPE[t];
+        byType[t] = rangeType === undefined
+            ? []
+            : await focas.readtofsr(1, count, rangeType);
+    }
+
+    const offsets = [];
+    for (let i = 0; i < count; i++) {
+        const entry = { number: i + 1, values: {} };
+        for (const t of TYPES) {
+            const r = byType[t][i];
+            entry.values[t] = r
+                ? { label: focas.tofsTypeName(t), value: r.value, raw: r.raw, dec: r.dec }
+                : null;
+        }
+        offsets.push(entry);
+    }
+
+    return {
+        ofs_type: info.ofs_type,
+        memory:   info.memory,
+        use_no:   info.use_no,
+        types:    TYPES.map(t => ({ type: t, label: focas.tofsTypeName(t) })),
+        offsets,
+    };
+}
+
 async function fnAxesData(focas, axisType) {
     // Each sub-type delegates to the matching reader in focas.js; the position ones
     // are the `what` bitmask readaxes() takes.
@@ -476,6 +535,7 @@ async function fnAll(focas, runModes, cncSeries) {
     const spindle = await read('actual_spindle_rpm',     () => focas.readactspindlespeed());
     const axes    = await read('axes_data',          () => fnAxesDataAll(focas));
     const tlife   = await read('tool_life',          () => fnToolLife(focas));
+    const tofs    = await read('tool_offsets',       () => fnToolOffsets(focas));
 
     return {
         controller:       sysinfo,
@@ -486,6 +546,7 @@ async function fnAll(focas, runModes, cncSeries) {
         feedrate_spindle: { actual_feedrate_mm_min: feed, actual_spindle_rpm: spindle },
         axes_data:        axes,
         tool_life:        tlife,
+        tool_offsets:     tofs,
         active_alarms:    alarms,
         alarm_status:     almstat,
         pmc_alarms:       pmcalm,
@@ -510,6 +571,7 @@ async function collect(ip, port, cnc_series, fn, subtype, params) {
             case 'program_number': result = await fnProgramNumber(focas);          break;
             case 'part_count':     result = await fnPartCount(focas);              break;
             case 'tool_life':      result = await fnToolLife(focas);               break;
+            case 'tool_offsets':   result = await fnToolOffsets(focas);            break;
             case 'alarm_messages': result = await fnAlarmMessages(focas, cnc_series); break;
             case 'alarm_status':   result = await fnAlarmStatus(focas, cnc_series);   break;
             case 'pmc_alarms':     result = await fnPmcAlarms(focas);                 break;

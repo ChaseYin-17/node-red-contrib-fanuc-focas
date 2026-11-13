@@ -47,9 +47,11 @@ node tools/probe-readonly-audit.js <ip>       # every call the node makes, with 
 node tools/probe-param-types.js <ip>          # cnc_rdparam3 attribute codes per parameter
 node tools/probe-position-compare.js <ip>     # readaxes() vs the vendor library's opcodes
 node tools/probe-progdir-layout.js <ip>       # the cnc_rdprogdir 72-byte record
+node tools/probe-tofs.js <ip>                 # tool-offset reads (0x08 / 0x0a)
 python tools/probe-dll-opcode.py <ip> 8193    # opcodes, captured from the vendor DLL
 python tools/probe-dll-opcode.py --stub       # the same request bytes, no controller needed
 python tools/probe-dll-param.py <ip> 8193     # argument order for param/macro/progdir/names
+python tools/probe-dll-tofs.py <ip> 8193      # argument order for the tool-offset reads
 ```
 
 Every `probe-*` here is **read-only**: no write, reset, clear or mode change. Keep it that way —
@@ -139,7 +141,8 @@ Any change to a payload shape means updating `README.md`, `fanuc-focas.html`'s h
 `docs/notes.md`'s notes if the wire is involved.
 
 `fanuc-focas.js` throws at load time if `focas.js` is missing something it calls (currently
-`TOOL_GROUP_PAGE`, `readalarmstatus2`, `readpmcalarm`) — the two files must be updated together.
+`TOOL_GROUP_PAGE`, `readalarmstatus2`, `readpmcalarm`, `readtofsinfo`, `readtofs`,
+`tofsTypeName`) — the two files must be updated together.
 
 ## Conventions
 

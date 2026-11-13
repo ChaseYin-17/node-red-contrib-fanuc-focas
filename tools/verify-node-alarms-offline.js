@@ -49,6 +49,10 @@ const stubs = {
     readngrp:            async () => 0,
     readusegrpid:        async () => ({ next: 0, use: 0, slct: 0 }),
     readgrpinfo4:        async () => [],
+    // Tool offsets: All Data reads the table size, then one range per type.
+    readtofsinfo:        async () => ({ ofs_type: 0, memory: 'memory A', use_no: 0 }),
+    readtofsr:           async () => [],
+    tofsTypeName:        (t) => `type ${t}`,
 
     readalarmcode:       async () => [],
     readalarmstatus2:    async () => ({ status: 0x82, bits: [1, 7] }),
